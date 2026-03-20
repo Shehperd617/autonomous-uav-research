@@ -53,12 +53,23 @@ No real hardware involved yet.
 
 ---
 
-## Early Results
+## Results So Far
 
-Simulation success rate: 100%
-Real world tested: No
-Hardware built: No
-Full understanding of my own code: Not yet
+| Version | Duration | Battery Used | VIP Status |
+|---------|----------|--------------|------------|
+| v8.1 | 238s | 28% | Secure |
+| v8.3 | 162s | 15% | Secure |
+
+100% success rate across all runs.
+Still simulation only.
+
+Latest improvements based on 
+expert architectural review:
+- True non-blocking FSM jam timer
+- Emergency brake after every engagement
+- Heartbeat failsafe monitoring
+- Geofence radius protection
+- Real velocity math
 
 ---
 
@@ -178,10 +189,16 @@ Rather know what's wrong early 🙂
 
 ## What's Next
 
-- [ ] Add visual detection (YOLO)
-- [ ] Test with Mission Planner
-- [ ] Understand the math better
-- [ ] Maybe try real hardware someday
+## What's Next
+
+- [x] Basic autonomous intercept
+- [x] FSM architecture
+- [x] Safety failsafes
+- [x] Mission Planner integration
+- [ ] Visual detection (YOLOv11)
+- [ ] GPS denied navigation
+- [ ] Warzone realism simulation
+- [ ] Real hardware someday
 
 ---
 
