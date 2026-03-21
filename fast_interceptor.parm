@@ -1,0 +1,24 @@
+# ============================================
+# FAST INTERCEPTOR PARAMS
+# Load at SITL startup: --defaults this_file
+# ============================================
+# Speed limits
+WPNAV_SPEED          3000
+WPNAV_SPEED_DN       1500
+WPNAV_ACCEL          800
+WPNAV_ACCEL_Z        500
+# Aggressive lean angle = more speed
+ANGLE_MAX            6000
+# Pilot speed
+PILOT_SPEED_UP       5000
+PILOT_SPEED_DN       3000
+# Loiter speed
+LOIT_SPEED           3000
+LOIT_ACC_MAX         800
+# Position controller
+PSC_VELXY_P          3.0
+PSC_POSZ_P           3.0
+# Arming checks relaxed for SITL
+ARMING_CHECK         0
+# GPS
+SIM_GPS_NUMSATS      15
