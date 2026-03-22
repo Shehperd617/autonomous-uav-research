@@ -1,53 +1,56 @@
 # ============================================================
 # intercept_params.parm
 # Custom ArduPilot SITL parameters for intercept navigation
-# Drone target speed: 40 m/s (144 km/h)
-# Load at startup:  sim_vehicle.py --add-param-file=intercept_params.parm
+#
+# NOTE: Default SITL quadcopter tops out ~17-20 m/s due to
+# simulated motor/frame limits. To reach 40 m/s you would
+# need a custom frame class. These params push the default
+# frame to its absolute max.
 # ============================================================
 
-# --- Speed limits ---------------------------------------------------
-WPNAV_SPEED          4000        # max horizontal speed in GUIDED/AUTO (cm/s → 40 m/s)
+# --- Speed limits (push to sim frame max) -----------------------
+WPNAV_SPEED          4000        # request 40 m/s (frame will cap lower)
 WPNAV_SPEED_DN       500         # max descent speed (cm/s)
 WPNAV_SPEED_UP       500         # max climb speed  (cm/s)
 
-# --- Acceleration ---------------------------------------------------
-WPNAV_ACCEL          800         # horizontal acceleration (cm/s/s → 8 m/s²)
+# --- Acceleration -----------------------------------------------
+WPNAV_ACCEL          800         # horizontal acceleration (cm/s/s)
 WPNAV_ACCEL_Z        300         # vertical acceleration  (cm/s/s)
 
-# --- Waypoint behaviour (prevent early decel at waypoints) ----------
-WPNAV_RADIUS         200         # acceptance radius (cm) — keep small
-WPNAV_RFND_USE       0           # don't use rangefinder for wp nav
+# --- Waypoint behaviour -----------------------------------------
+WPNAV_RADIUS         200         # acceptance radius (cm)
+WPNAV_RFND_USE       0
 
-# --- Loiter / position-hold tuning ---------------------------------
-LOIT_SPEED           4000        # loiter max speed (cm/s) — match WPNAV_SPEED
-LOIT_ACC_MAX         800         # loiter accel (cm/s/s)
-LOIT_BRK_ACCEL       400         # braking accel
-LOIT_BRK_DELAY       0.1         # brake delay (s) — near-instant braking
-LOIT_BRK_JERK        500         # braking jerk
+# --- Loiter / position-hold -------------------------------------
+LOIT_SPEED           4000        # match WPNAV_SPEED
+LOIT_ACC_MAX         800
+LOIT_BRK_ACCEL       400
+LOIT_BRK_DELAY       0.1
+LOIT_BRK_JERK        500
 
-# --- Position controller tuning ------------------------------------
-PSC_VELXY_P          5.0         # velocity XY P gain (default 2.0, raise for faster response)
+# --- Position controller ----------------------------------------
+PSC_VELXY_P          5.0         # aggressive velocity tracking
 
-# --- Angle limits (allow aggressive tilt for high speed) -----------
-ANGLE_MAX            4500        # max lean angle (centidegrees → 45°, default 30°)
+# --- Angle limits (allow max tilt for speed) --------------------
+ANGLE_MAX            4500        # 45 degrees (default 30)
 
-# --- GPS and EKF ---------------------------------------------------
-GPS_TYPE             1           # simulated GPS
+# --- GPS and EKF ------------------------------------------------
+GPS_TYPE             1
 EK2_ENABLE           0
 EK3_ENABLE           1
-AHRS_EKF_TYPE        3           # use EKF3
+AHRS_EKF_TYPE        3
 
-# --- General flight -------------------------------------------------
-PILOT_SPEED_UP       500         # pilot climb rate limit (cm/s)
-PILOT_SPEED_DN       300         # pilot descent rate limit (cm/s)
-ARMING_CHECK         1           # standard arming checks
+# --- General flight ---------------------------------------------
+PILOT_SPEED_UP       500
+PILOT_SPEED_DN       300
+ARMING_CHECK         1
 
-# --- Throttle / altitude -------------------------------------------
-THR_MIN              130         # minimum throttle (helps maintain speed in turns)
+# --- Throttle ---------------------------------------------------
+THR_MIN              130
 
-# --- Fence (safety) ------------------------------------------------
-FENCE_ENABLE         0           # disable geofence for SITL testing
+# --- Fence (off for testing) ------------------------------------
+FENCE_ENABLE         0
 FENCE_TYPE           0
 
-# --- Battery (avoid low-voltage failsafe in sim) -------------------
-BATT_MONITOR         0           # disable battery monitor in sim
+# --- Battery (off for sim) --------------------------------------
+BATT_MONITOR         0

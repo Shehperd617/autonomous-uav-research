@@ -10,36 +10,35 @@ PARAM_FILE="${SCRIPT_DIR}/intercept_params.parm"
 SIM_SCRIPT="${SCRIPT_DIR}/interceptor_v9.py"
 CONN_STRING="tcp:127.0.0.1:5760"
 
+# ---------- Kill any leftover SITL ----------
+pkill -f sim_vehicle.py 2>/dev/null || true
+pkill -f arducopter 2>/dev/null || true
+sleep 2
+
 # ---------- Preflight checks ----------
 command -v sim_vehicle.py >/dev/null 2>&1 || {
     echo "ERROR: sim_vehicle.py not found."
-    echo "       Make sure ArduPilot SITL tools are on your PATH."
-    echo "       (source Tools/environment_install/install-prereqs-ubuntu.sh)"
     exit 1
 }
-
-command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found."; exit 1; }
 python3 -c "import dronekit" 2>/dev/null || {
-    echo "Installing dronekit …"
-    pip3 install dronekit dronekit-sitl --break-system-packages
+    pip3 install dronekit --break-system-packages
 }
 
-# ---------- Start SITL in background ----------
+# ---------- Start SITL with --wipe to force clean param load ----------
 echo "============================================"
-echo " Launching ArduCopter SITL"
-echo " Param file: ${PARAM_FILE}"
+echo " Launching ArduCopter SITL (clean params)"
 echo "============================================"
 
 sim_vehicle.py \
     -v ArduCopter \
     --no-mavproxy \
     --add-param-file="${PARAM_FILE}" \
+    -w \
     -I 0 &
 SIM_PID=$!
 
-# Give SITL time to boot and bind its TCP port
-echo "Waiting 30 s for SITL to initialise …"
-sleep 30
+echo "Waiting 40 s for SITL to build + boot …"
+sleep 40
 
 # ---------- Run intercept script ----------
 echo ""
@@ -53,9 +52,7 @@ python3 "${SIM_SCRIPT}" --connect "${CONN_STRING}"
 STATUS=$?
 
 # ---------- Cleanup ----------
-echo ""
-echo "Shutting down SITL (PID ${SIM_PID}) …"
+echo "Shutting down SITL …"
 kill "${SIM_PID}" 2>/dev/null || true
 wait "${SIM_PID}" 2>/dev/null || true
-
 exit ${STATUS}
