@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PARAM_FILE="${SCRIPT_DIR}/intercept_params.parm"
 SIM_SCRIPT="${SCRIPT_DIR}/interceptor_v9.py"
-CONN_STRING="tcp:127.0.0.1:5762"
+CONN_STRING="tcp:127.0.0.1:5760"
 
 # ---------- Preflight checks ----------
 command -v sim_vehicle.py >/dev/null 2>&1 || {
@@ -38,8 +38,8 @@ sim_vehicle.py \
 SIM_PID=$!
 
 # Give SITL time to boot and bind its TCP port
-echo "Waiting 15 s for SITL to initialise …"
-sleep 15
+echo "Waiting 30 s for SITL to initialise …"
+sleep 30
 
 # ---------- Run intercept script ----------
 echo ""

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Interceptor v9 — Autonomous UAV Intercept Simulation — ArduPilot SITL
-=====================================================
+Interceptor v9 — Autonomous UAV Intercept Simulation (ArduPilot SITL)
+======================================================================
 Navigates a simulated drone to intercept a moving virtual target using
 overshoot-based simple_goto commands (bypasses the SET_POSITION_TARGET
 velocity bug where groundspeed stays at 0 m/s).
@@ -330,8 +330,8 @@ def main() -> None:
         description="UAV intercept simulation (ArduPilot SITL)",
     )
     parser.add_argument(
-        "--connect", default="tcp:127.0.0.1:5762",
-        help="MAVLink connection string (default: tcp:127.0.0.1:5762)",
+        "--connect", default="tcp:127.0.0.1:5760",
+        help="MAVLink connection string (default: tcp:127.0.0.1:5760)",
     )
     args = parser.parse_args()
     targets = build_default_targets()

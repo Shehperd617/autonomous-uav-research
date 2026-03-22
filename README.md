@@ -54,7 +54,7 @@ Once a target is intercepted (distance < 10 m), it is removed and the next targe
 
 | File | Purpose |
 |---|---|
-| `intercept_sim.py` | Main simulation script (guidance, nav, targets) |
+| `interceptor_v9.py` | Main simulation script (guidance, nav, targets) |
 | `intercept_params.parm` | Custom ArduPilot parameters for fast navigation |
 | `launch_sim.sh` | One-command launcher: starts SITL + runs script |
 
@@ -77,7 +77,7 @@ sim_vehicle.py -v ArduCopter --no-mavproxy \
     --add-param-file=intercept_params.parm
 
 # Terminal 2 — intercept script
-python3 intercept_sim.py --connect tcp:127.0.0.1:5762
+python3 interceptor_v9.py --connect tcp:127.0.0.1:5760
 ```
 
 ## Key Parameters (intercept_params.parm)
