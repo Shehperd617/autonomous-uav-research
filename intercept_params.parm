@@ -1,0 +1,46 @@
+# ============================================================
+# intercept_params.parm
+# Custom ArduPilot SITL parameters for intercept navigation
+# Load at startup:  sim_vehicle.py --add-param-file=intercept_params.parm
+# ============================================================
+
+# --- Speed limits ---------------------------------------------------
+WPNAV_SPEED          1500        # max horizontal speed in GUIDED/AUTO (cm/s → 15 m/s)
+WPNAV_SPEED_DN       300         # max descent speed (cm/s)
+WPNAV_SPEED_UP       500         # max climb speed  (cm/s)
+
+# --- Acceleration ---------------------------------------------------
+WPNAV_ACCEL          400         # horizontal acceleration (cm/s/s → 4 m/s²)
+WPNAV_ACCEL_Z        200         # vertical acceleration  (cm/s/s)
+
+# --- Waypoint behaviour (prevent early decel at waypoints) ----------
+WPNAV_RADIUS         200         # acceptance radius (cm) — keep small
+WPNAV_RFND_USE       0           # don't use rangefinder for wp nav
+
+# --- Loiter / position-hold tuning ---------------------------------
+LOIT_SPEED           1500        # loiter max speed (cm/s) — match WPNAV_SPEED
+LOIT_ACC_MAX         500         # loiter accel (cm/s/s)
+LOIT_BRK_ACCEL       250         # braking accel
+LOIT_BRK_DELAY       0.1         # brake delay (s) — near-instant braking
+LOIT_BRK_JERK        500         # braking jerk
+
+# --- GPS and EKF ---------------------------------------------------
+GPS_TYPE             1           # simulated GPS
+EK2_ENABLE           0
+EK3_ENABLE           1
+AHRS_EKF_TYPE        3           # use EKF3
+
+# --- General flight -------------------------------------------------
+PILOT_SPEED_UP       500         # pilot climb rate limit (cm/s)
+PILOT_SPEED_DN       300         # pilot descent rate limit (cm/s)
+ARMING_CHECK         1           # standard arming checks
+
+# --- Throttle / altitude -------------------------------------------
+THR_MIN              130         # minimum throttle (helps maintain speed in turns)
+
+# --- Fence (safety) ------------------------------------------------
+FENCE_ENABLE         0           # disable geofence for SITL testing
+FENCE_TYPE           0
+
+# --- Battery (avoid low-voltage failsafe in sim) -------------------
+BATT_MONITOR         0           # disable battery monitor in sim

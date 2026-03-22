@@ -1,219 +1,98 @@
-# autonomous-uav-research
-Learning project exploring autonomous  drone systems in simulation. Complete  beginner just starting out.
-# Autonomous UAV Research — Learning Project
+# Autonomous UAV Intercept Simulation
 
-Hey there,
+ArduPilot SITL simulation for autonomous navigation and intercept of moving virtual targets.
 
-Started exploring autonomous drone systems 
-a few days ago purely out of curiosity. 
-Complete beginner with no formal background 
-in aerospace or engineering. Just documenting 
-my progress as I go.
+## The Problem
 
----
+MAVLink `SET_POSITION_TARGET_GLOBAL_INT` velocity commands are ignored by ArduCopter's position controller in GUIDED mode — the drone reports 0 m/s groundspeed and cannot close distance below ~22 m to a moving waypoint.
 
-## What I'm Exploring
+## The Fix: Overshoot Navigation
 
-Got curious about how drones could navigate 
-and make decisions on their own without 
-human input.
+Instead of commanding velocities, we use `simple_goto` aimed at a point **50 m past** the predicted target position. This means:
 
-Simple question I started with:
-*Can a drone autonomously locate, track, 
-and respond to another drone — entirely 
-by itself?*
+- The flight controller always has a distant waypoint ahead and never triggers deceleration.
+- The drone flies *through* the target coordinates at full cruise speed.
+- Contact is registered when the drone passes within 10 m of the target.
 
-Still working toward a proper answer.
+## Architecture
 
----
+```
+┌─────────────────────────────────────────────────┐
+│                  Guidance Loop                   │
+│  (runs every 0.25 s)                            │
+│                                                  │
+│  1. Update all SimTarget positions               │
+│  2. Select highest-priority target (nearest tie) │
+│  3. Estimate time-to-intercept                   │
+│  4. Predict target position at intercept time    │
+│  5. Apply ProNav bearing correction              │
+│  6. Project overshoot point 50 m past prediction │
+│  7. Issue simple_goto to overshoot point         │
+│  8. Check contact (< 10 m → intercept)           │
+└─────────────────────────────────────────────────┘
+```
 
-## What I've Built So Far
+### Proportional Navigation (ProNav)
 
-A basic simulation where a drone:
+The bearing to the aim point is corrected by the line-of-sight (LOS) rate:
 
-- Takes off and navigates automatically
-- Locates and tracks a target autonomously
-- Makes real time decisions on how to respond
-- Returns home after completing its task
+```
+commanded_bearing = LOS_bearing + N × LOS_rate × dt
+```
 
-Everything runs in simulation only.
-No real hardware involved yet.
+where **N = 3** (navigation gain). This biases the flight path toward the future intercept point, reducing the pursuit curve.
 
----
+### Priority-Based Target Selection
 
-## Tools I'm Using
+Targets carry an integer priority (lower = more important). The selector picks:
+1. Lowest priority number first.
+2. Among equal priorities, the nearest target wins.
 
-- Python — still learning the language
-- ArduPilot SITL — surprisingly powerful simulator
-- DroneKit — handles drone communication
-- MAVProxy — ground control bridge
-- Claude AI — genuinely been the most 
-  useful learning tool throughout this
-- A lot of trial and error honestly
+Once a target is intercepted (distance < 10 m), it is removed and the next target is selected.
 
----
+## Files
 
-## Results So Far
+| File | Purpose |
+|---|---|
+| `intercept_sim.py` | Main simulation script (guidance, nav, targets) |
+| `intercept_params.parm` | Custom ArduPilot parameters for fast navigation |
+| `launch_sim.sh` | One-command launcher: starts SITL + runs script |
 
-| Version | Duration | Battery Used | VIP Status |
-|---------|----------|--------------|------------|
-| v8.1 | 238s | 28% | Secure |
-| v8.3 | 162s | 15% | Secure |
+## Quick Start
 
-100% success rate across all runs.
-Still simulation only.
+```bash
+# 1. Make sure ArduPilot SITL tools are on PATH
+source ~/ardupilot/Tools/environment_install/install-prereqs-ubuntu.sh
 
-Latest improvements based on 
-expert architectural review:
-- True non-blocking FSM jam timer
-- Emergency brake after every engagement
-- Heartbeat failsafe monitoring
-- Geofence radius protection
-- Real velocity math
+# 2. Launch everything
+chmod +x launch_sim.sh
+bash launch_sim.sh
+```
 
----
+Or run the pieces separately:
 
-## Algorithms I've Been Learning About
+```bash
+# Terminal 1 — SITL
+sim_vehicle.py -v ArduCopter --no-mavproxy \
+    --add-param-file=intercept_params.parm
 
-Started coming across some interesting 
-concepts used in real aerospace systems:
+# Terminal 2 — intercept script
+python3 intercept_sim.py --connect tcp:127.0.0.1:5762
+```
 
-- Kalman Filters — filtering noisy sensor data
-- Proportional Navigation — guidance mathematics
-- Predictive Intercept — anticipating movement
-- Path Planning — finding optimal routes
+## Key Parameters (intercept_params.parm)
 
-Don't fully understand all of them yet
-but making progress gradually.
+| Parameter | Value | Why |
+|---|---|---|
+| `WPNAV_SPEED` | 1500 (15 m/s) | High cruise speed for intercept |
+| `WPNAV_ACCEL` | 400 (4 m/s²) | Fast acceleration to cruise |
+| `WPNAV_RADIUS` | 200 (2 m) | Tight acceptance radius |
+| `LOIT_BRK_DELAY` | 0.1 s | Near-instant braking when needed |
+| `THR_MIN` | 130 | Maintains speed through turns |
 
----
+## Tuning
 
-## What I Want To Learn Next
-
-- Visual object detection using AI cameras
-- Autonomous navigation without GPS
-- What it actually takes to go from 
-  simulation to real hardware
-- How machine learning fits into 
-  autonomous systems
-
----
-
-## Honest Note
-
-Not an engineer or aerospace student.
-Just someone who got curious and 
-started building things to learn.
-
-If you have experience in autonomous 
-systems, drone development, or aerospace 
-algorithms — honest feedback is genuinely 
-welcome. Rather know what's wrong early 
-than waste time going in the wrong direction.
-
----
-
-## What's Next
-
-- [ ] Visual detection with YOLOv11
-- [ ] Mission Planner map integration
-- [ ] Better understanding of the math
-- [ ] Real hardware when ready
-
----
-
-## Disclaimer
-
-This is purely a simulation and 
-learning experiment. No real hardware, 
-no real deployment. Built entirely to 
-understand autonomous systems and 
-algorithms from the ground up.
-
----
-
-Just started. Long way to go.
-Enjoying the process so far.
-
-Simulation success rate:  100%
-Real world tested:        Not yet
-Hardware built:           Not yet
-Do I know what I’m doing: Debatable 😂
-
-
----
-
-## Algorithms I've Been Playing With
-
-Started learning about some interesting
-concepts used in real aerospace:
-
-- Kalman Filters — smoothing noisy data
-- Proportional Navigation — guidance math
-- Predictive algorithms — anticipating movement
-- Path planning — finding optimal routes
-
-Barely understand them fully yet.
-But getting there slowly 🙂
-
----
-
-## What I Want To Learn Next
-
-- How drones detect objects visually
-- How autonomous navigation works
-  without GPS
-- What it takes to move from
-  simulation to real hardware
-- How AI fits into all of this
-
----
-
-## Honest Note
-
-Not an engineer.
-Not a student.
-Just someone who got curious
-and started building.
-
-If you have experience in:
-- Autonomous systems
-- Drone development
-- Aerospace algorithms
-
-I'd genuinely love any feedback.
-Harsh is welcome.
-Rather know what's wrong early 🙂
-
----
-
-## What's Next
-
-## What's Next
-
-- [x] Basic autonomous intercept
-- [x] FSM architecture
-- [x] Safety failsafes
-- [x] Mission Planner integration
-- [ ] Visual detection (YOLOv11)
-- [ ] GPS denied navigation
-- [ ] Warzone realism simulation
-- [ ] Real hardware someday
-
----
-
-## Disclaimer
-
-Purely a learning experiment.
-Simulation only.
-No real hardware involved.
-Built to understand autonomous
-systems and algorithms.
-Nothing more.
-
----
-
-*Just started. Long way to go.
-But enjoying the journey so far* 🚀
-
-
+- **OVERSHOOT_DISTANCE_M** (default 50): Increase if the drone still decelerates before contact. Decrease for tighter turning at the cost of possible premature braking.
+- **CONTACT_THRESHOLD_M** (default 10): The "kill radius." Smaller values require more precise guidance.
+- **NAV_GAIN** (default 3.0): ProNav constant N. Higher values steer more aggressively toward the predicted intercept. Values above 4-5 can cause oscillation.
+- **COMMAND_INTERVAL_S** (default 0.25): How often the guidance loop re-aims. Faster updates improve tracking but add MAVLink traffic.
