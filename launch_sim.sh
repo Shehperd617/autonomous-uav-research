@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
 # launch_sim.sh — Start ArduCopter SITL + intercept script
-# Usage:  bash launch_sim.sh
 # ============================================================
 set -euo pipefail
 
@@ -10,23 +9,23 @@ PARAM_FILE="${SCRIPT_DIR}/intercept_params.parm"
 SIM_SCRIPT="${SCRIPT_DIR}/interceptor_v9.py"
 CONN_STRING="tcp:127.0.0.1:5760"
 
-# ---------- Kill any leftover SITL ----------
+# ---------- Kill leftover SITL ----------
+echo "Cleaning up old processes …"
 pkill -f sim_vehicle.py 2>/dev/null || true
 pkill -f arducopter 2>/dev/null || true
 sleep 2
 
-# ---------- Preflight checks ----------
+# ---------- Preflight ----------
 command -v sim_vehicle.py >/dev/null 2>&1 || {
-    echo "ERROR: sim_vehicle.py not found."
-    exit 1
-}
+    echo "ERROR: sim_vehicle.py not on PATH"; exit 1; }
 python3 -c "import dronekit" 2>/dev/null || {
-    pip3 install dronekit --break-system-packages
-}
+    pip3 install dronekit --break-system-packages; }
 
-# ---------- Start SITL with --wipe to force clean param load ----------
+# ---------- Start SITL ----------
 echo "============================================"
-echo " Launching ArduCopter SITL (clean params)"
+echo " Launching ArduCopter SITL"
+echo " Params: ${PARAM_FILE}"
+echo " Using -w flag (wipe) for clean param load"
 echo "============================================"
 
 sim_vehicle.py \
@@ -37,14 +36,13 @@ sim_vehicle.py \
     -I 0 &
 SIM_PID=$!
 
-echo "Waiting 40 s for SITL to build + boot …"
+echo "Waiting 40 s for SITL …"
 sleep 40
 
-# ---------- Run intercept script ----------
+# ---------- Run script ----------
 echo ""
 echo "============================================"
-echo " Starting intercept simulation"
-echo " Connection: ${CONN_STRING}"
+echo " Starting intercept — ${CONN_STRING}"
 echo "============================================"
 echo ""
 
@@ -52,7 +50,6 @@ python3 "${SIM_SCRIPT}" --connect "${CONN_STRING}"
 STATUS=$?
 
 # ---------- Cleanup ----------
-echo "Shutting down SITL …"
 kill "${SIM_PID}" 2>/dev/null || true
 wait "${SIM_PID}" 2>/dev/null || true
 exit ${STATUS}
