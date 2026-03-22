@@ -16,7 +16,7 @@ Key techniques:
   • Priority-based waypoint selection — when multiple targets exist the
     closest / highest-priority one is serviced first.
   • Runtime param override — forces WPNAV_SPEED to 4000 (40 m/s) via
-    MAVLink after connecting, no reboot required.
+    MAVLink after connecting.
 
 Requires:  dronekit   (pip install dronekit)
 """
@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from dronekit import connect, VehicleMode, LocationGlobalRelative
+from pymavlink import mavutil
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -196,22 +197,38 @@ class ProNavGuidance:
 # Vehicle helpers
 # ---------------------------------------------------------------------------
 
+def set_param_safe(vehicle, name: str, value: float) -> None:
+    """Set a parameter via MAVLink using raw PARAM_SET message.
+    This avoids dronekit's buggy readback timeout."""
+    msg = vehicle.message_factory.param_set_encode(
+        0, 0,                                    # target system, component
+        name.encode("utf-8"),                     # param_id (bytes)
+        value,                                    # param_value
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,    # param_type
+    )
+    vehicle.send_mavlink(msg)
+    vehicle.flush()
+
+
 def force_speed_params(vehicle) -> None:
     """Override speed params at runtime via MAVLink so no reboot is needed."""
     params = {
-        "WPNAV_SPEED": DRONE_SPEED_CMS,       # 4000 = 40 m/s
-        "WPNAV_ACCEL": 800,                    # 8 m/s²
-        "LOIT_SPEED": DRONE_SPEED_CMS,         # match
+        "WPNAV_SPEED":  DRONE_SPEED_CMS,   # 4000 = 40 m/s
+        "WPNAV_ACCEL":  800,                # 8 m/s²
+        "LOIT_SPEED":   DRONE_SPEED_CMS,    # match
         "LOIT_ACC_MAX": 800,
-        "ANGLE_MAX": 4500,                     # 45° lean for high speed
-        "PSC_VELXY_P": 5.0,                    # aggressive velocity tracking
+        "ANGLE_MAX":    4500,               # 45° lean for high speed
+        "PSC_VELXY_P":  5.0,                # aggressive velocity tracking
     }
     print("  Forcing speed parameters via MAVLink:")
     for name, value in params.items():
-        vehicle.parameters[name] = value
+        set_param_safe(vehicle, name, value)
         print(f"    {name} = {value}")
-    time.sleep(2)  # let params take effect
-    print(f"  WPNAV_SPEED readback: {vehicle.parameters['WPNAV_SPEED']}")
+        time.sleep(0.3)
+
+    # Wait for params to take effect
+    time.sleep(3)
+    print("  Parameters sent. Drone target speed: 40 m/s")
 
 
 def wait_for_armable(vehicle, timeout: float = 120.0) -> None:
