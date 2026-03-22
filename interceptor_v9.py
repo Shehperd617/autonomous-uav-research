@@ -4,11 +4,12 @@ Interceptor v9 — Autonomous UAV Intercept Simulation (ArduPilot SITL)
 ======================================================================
 40 m/s interceptor drone vs moving targets.
 
-Uses a custom fast airframe defined in intercept_params.parm (low drag,
-high thrust, light weight) so the SITL physics engine actually allows
-40 m/s flight.
+Built for ArduPilot master (2025+) which uses:
+  ATC_ANGLE_MAX (degrees)  not ANGLE_MAX (centidegrees)
+  LOIT_SPEED_MS (m/s)      not WPNAV_SPEED (cm/s)
+  LOIT_ACC_MAX_M (m/s²)    not WPNAV_ACCEL (cm/s²)
 
-Targets spawn AFTER takeoff to avoid drift during boot.
+The key to high speed: ATC_ANGLE_MAX = 60° (default 30° caps at ~10 m/s)
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ from pymavlink import mavutil
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OVERSHOOT_DISTANCE_M: float = 100.0      # aim far past (drone is fast)
-CONTACT_THRESHOLD_M: float = 10.0        # intercept radius
-COMMAND_INTERVAL_S: float = 0.20          # 5 Hz guidance
+OVERSHOOT_DISTANCE_M: float = 100.0
+CONTACT_THRESHOLD_M: float = 10.0
+COMMAND_INTERVAL_S: float = 0.20
 DEFAULT_ALT_M: float = 30.0
 EARTH_RADIUS_M: float = 6_371_000.0
 NAV_GAIN: float = 3.0
@@ -151,18 +152,36 @@ def set_param(vehicle, name, value):
     vehicle.flush()
 
 def force_speed_params(vehicle):
+    """Set correct params for ArduPilot master (2025+)."""
     params = {
-        "WPNAV_SPEED": 4000, "WPNAV_ACCEL": 1000,
-        "LOIT_SPEED": 4000, "LOIT_ACC_MAX": 1000,
-        "ANGLE_MAX": 6000, "PSC_VELXY_P": 5.0,
+        # THE KEY: max lean angle in DEGREES (not centidegrees!)
+        "ATC_ANGLE_MAX":  60.0,     # 60° lean (default 30°)
+        "ATC_ANGLE_BOOST": 0.0,     # don't waste thrust on tilt compensation
+        "ATC_ACC_P_MAX":  2200.0,   # fast pitch rate
+        "ATC_ACC_R_MAX":  2200.0,   # fast roll rate
+        # Speed and acceleration in M/S (not cm/s!)
+        "LOIT_SPEED_MS":  40.0,     # 40 m/s max speed
+        "LOIT_ACC_MAX_M": 15.0,     # 15 m/s² acceleration
+        "LOIT_BRK_ACC_M": 8.0,     # braking accel
+        "LOIT_BRK_DELAY": 0.1,     # instant braking
+        "LOIT_BRK_JRK_M": 15.0,    # braking jerk
+        # Position controller
+        "PSC_NE_VEL_P":   6.0,     # aggressive velocity tracking
+        "PSC_NE_VEL_I":   2.0,
+        "PSC_NE_VEL_D":   0.5,
+        "PSC_NE_POS_P":   2.0,
+        "PSC_JERK_NE":    20.0,
     }
-    print("\n  Forcing speed params via MAVLink:")
+    print("\n  Forcing speed params (ArduPilot master format):")
     for k, v in params.items():
         set_param(vehicle, k, v)
         print(f"    {k} = {v}")
-        time.sleep(0.3)
+        time.sleep(0.2)
     time.sleep(3)
-    print("  Done. Target speed: 40 m/s\n")
+    print(f"\n  ✓ ATC_ANGLE_MAX = 60° (was 30°)")
+    print(f"  ✓ LOIT_SPEED_MS = 40 m/s (was 12.5)")
+    print(f"  ✓ LOIT_ACC_MAX_M = 15 m/s²")
+    print(f"  Target top speed: ~35-40 m/s\n")
 
 def wait_armable(vehicle, timeout=120):
     print("  Waiting for armable …")
@@ -191,7 +210,7 @@ def arm_and_takeoff(vehicle, alt):
         time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
-# Build targets (close, after takeoff)
+# Build targets (close, spawned after takeoff)
 # ---------------------------------------------------------------------------
 
 def build_targets(lat, lon):
