@@ -2,6 +2,8 @@
 """
 Interceptor v9 — Autonomous UAV Intercept Simulation (ArduPilot SITL)
 ======================================================================
+Drone speed: 40 m/s (144 km/h)
+
 Navigates a simulated drone to intercept a moving virtual target using
 overshoot-based simple_goto commands (bypasses the SET_POSITION_TARGET
 velocity bug where groundspeed stays at 0 m/s).
@@ -13,9 +15,10 @@ Key techniques:
     predicted future position of the target.
   • Priority-based waypoint selection — when multiple targets exist the
     closest / highest-priority one is serviced first.
-  • Custom .parm file — loaded at SITL startup for tuned speed/accel.
+  • Runtime param override — forces WPNAV_SPEED to 4000 (40 m/s) via
+    MAVLink after connecting, no reboot required.
 
-Requires:  dronekit, dronekit-sitl   (pip install dronekit dronekit-sitl)
+Requires:  dronekit   (pip install dronekit)
 """
 
 from __future__ import annotations
@@ -33,12 +36,13 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OVERSHOOT_DISTANCE_M: float = 50.0      # aim this far past the target
+DRONE_SPEED_CMS: float = 4000.0          # 40 m/s in cm/s
+OVERSHOOT_DISTANCE_M: float = 50.0       # aim this far past the target
 CONTACT_THRESHOLD_M: float = 10.0        # "intercept" when closer than this
-COMMAND_INTERVAL_S: float = 0.25         # guidance-loop period
-DEFAULT_ALT_M: float = 30.0             # cruise altitude AGL
+COMMAND_INTERVAL_S: float = 0.25          # guidance-loop period
+DEFAULT_ALT_M: float = 30.0              # cruise altitude AGL
 EARTH_RADIUS_M: float = 6_371_000.0
-NAV_GAIN: float = 3.0                   # ProNav proportionality constant (N)
+NAV_GAIN: float = 3.0                    # ProNav proportionality constant (N)
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -192,7 +196,25 @@ class ProNavGuidance:
 # Vehicle helpers
 # ---------------------------------------------------------------------------
 
-def wait_for_armable(vehicle, timeout: float = 60.0) -> None:
+def force_speed_params(vehicle) -> None:
+    """Override speed params at runtime via MAVLink so no reboot is needed."""
+    params = {
+        "WPNAV_SPEED": DRONE_SPEED_CMS,       # 4000 = 40 m/s
+        "WPNAV_ACCEL": 800,                    # 8 m/s²
+        "LOIT_SPEED": DRONE_SPEED_CMS,         # match
+        "LOIT_ACC_MAX": 800,
+        "ANGLE_MAX": 4500,                     # 45° lean for high speed
+        "PSC_VELXY_P": 5.0,                    # aggressive velocity tracking
+    }
+    print("  Forcing speed parameters via MAVLink:")
+    for name, value in params.items():
+        vehicle.parameters[name] = value
+        print(f"    {name} = {value}")
+    time.sleep(2)  # let params take effect
+    print(f"  WPNAV_SPEED readback: {vehicle.parameters['WPNAV_SPEED']}")
+
+
+def wait_for_armable(vehicle, timeout: float = 120.0) -> None:
     print("  Waiting for vehicle to become armable …")
     t0 = time.time()
     while not vehicle.is_armable:
@@ -234,6 +256,9 @@ def run_simulation(connection_string: str, targets: List[SimTarget]) -> None:
     print(f"Connecting to vehicle on {connection_string} …")
     vehicle = connect(connection_string, wait_ready=True)
 
+    # Force speed params BEFORE arming
+    force_speed_params(vehicle)
+
     # Graceful Ctrl-C
     def _sig(sig, frame):
         print("\n[SIGINT] Landing …")
@@ -251,6 +276,10 @@ def run_simulation(connection_string: str, targets: List[SimTarget]) -> None:
     intercepted: list[int] = []
 
     print("\n=== Intercept loop started ===\n")
+    print(f"  Drone max speed: {DRONE_SPEED_CMS/100:.0f} m/s")
+    print(f"  Overshoot: {OVERSHOOT_DISTANCE_M:.0f} m")
+    print(f"  Contact threshold: {CONTACT_THRESHOLD_M:.0f} m")
+    print(f"  Targets: {len(active_targets)}\n")
 
     while active_targets:
         loc = vehicle.location.global_relative_frame
@@ -270,7 +299,8 @@ def run_simulation(connection_string: str, targets: List[SimTarget]) -> None:
 
         # Check intercept
         if dist <= CONTACT_THRESHOLD_M:
-            print(f"  ★ INTERCEPT target #{tgt.id} at {dist:.1f} m")
+            print(f"\n  ★ INTERCEPT target #{tgt.id} at {dist:.1f} m  "
+                  f"(gs={groundspeed:.1f} m/s)\n")
             intercepted.append(tgt.id)
             active_targets.remove(tgt)
             guidance = ProNavGuidance()          # reset LOS state
@@ -283,7 +313,7 @@ def run_simulation(connection_string: str, targets: List[SimTarget]) -> None:
         brg = bearing_deg(d_lat, d_lon, tgt.lat, tgt.lon)
         print(
             f"  Tgt #{tgt.id}  dist={dist:6.1f} m  "
-            f"brg={brg:5.1f}°  gs={groundspeed:4.1f} m/s  "
+            f"brg={brg:5.1f}°  gs={groundspeed:5.1f} m/s  "
             f"aim→({wp.lat:.6f}, {wp.lon:.6f})"
         )
 
@@ -301,26 +331,28 @@ def run_simulation(connection_string: str, targets: List[SimTarget]) -> None:
 # ---------------------------------------------------------------------------
 
 def build_default_targets() -> List[SimTarget]:
-    """Three moving targets near the SITL default home (Canberra)."""
+    """Three moving targets near the SITL default home (Canberra).
+    Target speeds: 5-12 m/s (drone does 40 m/s, so these are catchable).
+    """
     home_lat, home_lon = -35.363262, 149.165237
     return [
         SimTarget(
             id=1, priority=1,
             lat=home_lat + 0.002, lon=home_lon + 0.001,
             alt=DEFAULT_ALT_M,
-            course_deg=90, speed_mps=5,
+            course_deg=90, speed_mps=8,
         ),
         SimTarget(
             id=2, priority=2,
             lat=home_lat - 0.001, lon=home_lon + 0.003,
             alt=DEFAULT_ALT_M,
-            course_deg=180, speed_mps=3,
+            course_deg=180, speed_mps=5,
         ),
         SimTarget(
             id=3, priority=3,
             lat=home_lat + 0.003, lon=home_lon - 0.002,
             alt=DEFAULT_ALT_M,
-            course_deg=270, speed_mps=4,
+            course_deg=270, speed_mps=12,
         ),
     ]
 
