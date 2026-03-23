@@ -295,15 +295,31 @@ class Drone:
         self.boot_time = time.time()
         print(f"[CONN] Heartbeat — system {self.sys_id}")
 
-        # Wait for position stream
+        # Request ALL data streams at 10 Hz — SITL won't send
+        # GLOBAL_POSITION_INT until we ask for it
+        print(f"[CONN] Requesting data streams ...")
+        for stream_id in range(13):
+            self.mav.mav.request_data_stream_send(
+                self.sys_id, self.comp_id,
+                stream_id, 10, 1)
+        time.sleep(1)
+
+        # Wait for GPS fix with progress
         print(f"[CONN] Waiting for GPS fix ...")
-        for _ in range(60):
+        for i in range(120):
             msg = self.mav.recv_match(type='GLOBAL_POSITION_INT',
-                                       blocking=True, timeout=2)
+                                       blocking=True, timeout=1)
             if msg and msg.lat != 0:
                 print(f"[CONN] GPS OK: {msg.lat/1e7:.6f}, {msg.lon/1e7:.6f}")
                 break
-        time.sleep(BOOT_WAIT_S)
+            if i % 10 == 0 and i > 0:
+                print(f"[CONN] Still waiting for GPS ... ({i}s)")
+                # Re-request streams in case they didn't stick
+                for sid in range(13):
+                    self.mav.mav.request_data_stream_send(
+                        self.sys_id, self.comp_id, sid, 10, 1)
+        else:
+            print("[CONN] WARNING: No GPS after 120s, proceeding anyway")
 
     def _tboot_ms(self):
         return int((time.time() - self.boot_time) * 1000)
