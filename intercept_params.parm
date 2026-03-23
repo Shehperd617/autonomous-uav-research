@@ -1,65 +1,69 @@
 # ============================================================
 # intercept_params.parm
-# Fast interceptor — correct params for ArduPilot master (2025+)
-#
-# YOUR VERSION does NOT have WPNAV_SPEED (removed in master).
-# Speed is controlled by:
-#   ATC_ANGLE_MAX  (degrees) — max tilt, THE speed limiter
-#   LOIT_SPEED_MS  (m/s) — loiter/guided max speed
-#   PSC_NE_VEL_P   — position controller velocity gain
+# Based on ArduPilot's freestyle.param (racing quad, 0.8 kg)
+# with speed pushed to 40 m/s for intercept missions
 # ============================================================
 
-# === THE KEY SPEED PARAMS ===================================
+# === SPEED — the params that actually matter ==================
+ATC_ANGLE_MAX    70.0           # 70° lean (default 30° caps at 10 m/s)
+WP_SPD           40.0           # waypoint speed 40 m/s
+LOIT_SPEED_MS    40.0           # loiter/guided speed 40 m/s
+LOIT_ACC_MAX_M   15.0           # 15 m/s² accel (freestyle default 10)
+LOIT_BRK_ACC_M   8.0
+LOIT_BRK_JRK_M   15.0
+LOIT_BRK_DELAY   0.1
 
-# Max lean angle: 60° (default 30°)
-# This is THE bottleneck. At 30° the drone physically can't
-# accelerate past ~10 m/s. At 60° it can reach 30-40 m/s.
-ATC_ANGLE_MAX        60
+# === MOTOR — freestyle racing quad ============================
+MOT_THST_EXPO    0.7
+MOT_THST_HOVER   0.125          # very low = lots of excess thrust
+MOT_SPIN_ARM     0.01
+MOT_SPIN_MIN     0.01
+MOT_SPOOL_TIME   0.25
 
-# Guided/Loiter speed limit: 40 m/s
-LOIT_SPEED_MS        40
+# === ATTITUDE CONTROLLER (from freestyle.param) ===============
+ATC_ACC_P_MAX    2200.0
+ATC_ACC_R_MAX    2200.0
+ATC_ACC_Y_MAX    1200.0
+ATC_ANG_PIT_P    15.0
+ATC_ANG_RLL_P    15.0
+ATC_ANG_YAW_P    10.0
+ATC_INPUT_TC     0.04
+ATC_ANGLE_BOOST  0.0
+ATC_THR_MIX_MAN  4.0
+ATC_RAT_PIT_P    0.04
+ATC_RAT_PIT_I    0.04
+ATC_RAT_PIT_D    0.0012
+ATC_RAT_RLL_P    0.048
+ATC_RAT_RLL_I    0.048
+ATC_RAT_RLL_D    0.0008
+ATC_RAT_YAW_P    0.5
+ATC_RAT_YAW_I    0.05
+ATC_RAT_YAW_D    0.01
 
-# Loiter acceleration: 15 m/s² (default 5)
-LOIT_ACC_MAX_M       15
+# === WAYPOINT NAV =============================================
+WP_ACC           11.0
+WP_ACC_Z         3.0
+WP_JERK          6.0
+WP_SPD_DN        5.0
+WP_SPD_UP        5.0
 
-# Loiter braking
-LOIT_BRK_ACC_M       8
-LOIT_BRK_DELAY       0.1
-LOIT_BRK_JRK_M       15
+# === POSITION CONTROLLER =====================================
+PSC_NE_VEL_P     6.0
+PSC_NE_VEL_I     2.0
+PSC_NE_VEL_D     0.5
+PSC_NE_POS_P     2.0
+PSC_JERK_NE      20.0
 
-# === POSITION CONTROLLER (make it aggressive) ===============
+# === GPS / EKF ================================================
+GPS_TYPE         1
+EK2_ENABLE       0
+EK3_ENABLE       1
+AHRS_EKF_TYPE    3
+EK3_GLITCH_RAD   0.0
 
-# NE (North-East) velocity gains — higher = tracks faster
-PSC_NE_VEL_P         6.0
-PSC_NE_VEL_I         2.0
-PSC_NE_VEL_D         0.5
-
-# NE position gain
-PSC_NE_POS_P         2.0
-
-# Jerk limits — higher = snappier response
-PSC_JERK_NE          20
-
-# Override angle limit in position controller (0 = use ATC_ANGLE_MAX)
-PSC_ANGLE_MAX        0
-
-# === ATTITUDE CONTROLLER (support fast flight) ==============
-
-# Increase pitch/roll rate limits for fast maneuvering
-ATC_ACC_P_MAX        2200
-ATC_ACC_R_MAX        2200
-
-# Angle boost off — don't waste throttle compensating tilt
-ATC_ANGLE_BOOST      0
-
-# === GPS / EKF ==============================================
-GPS_TYPE             1
-EK2_ENABLE           0
-EK3_ENABLE           1
-AHRS_EKF_TYPE        3
-
-# === SAFETY OFF (sim only) ==================================
-ARMING_CHECK         1
-FENCE_ENABLE         0
-FENCE_TYPE           0
-BATT_MONITOR         0
+# === SAFETY OFF (sim only) ====================================
+ARMING_CHECK     1
+FENCE_ENABLE     0
+FENCE_TYPE       0
+BATT_MONITOR     0
+FRAME_CLASS      1
