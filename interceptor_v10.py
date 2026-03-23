@@ -1,60 +1,85 @@
 #!/usr/bin/env python3
 """
-Interceptor v10 — Autonomous Multi-Target Drone Intercept (ArduPilot SITL)
-==========================================================================
-Hybrid guidance: PRONAV (>50m) → PURSUIT (15-50m) → RAM (<15m)
-Velocity NED commands bypass waypoint planner speed cap.
-pymavlink only — no dronekit dependency.
+Interceptor v10 — Built on v9's proven dronekit boot sequence
+=============================================================
+KEPT FROM v9 (fast boot, works):
+  - dronekit connect/arm/takeoff — UNCHANGED
+  - same target spawning
+  - same param forcing
+
+CHANGED (fixes oscillation + speed):
+  1. simple_goto → velocity NED commands (bypasses 14 m/s cap)
+  2. ProNav killed under 50m → pure pursuit (fixes oscillation)
+  3. Ram mode under 15m
+  4. Overshoot waypoint REMOVED
+  5. Targets sorted nearest-first
+  6. Contact threshold 8m
 """
+
+from __future__ import annotations
 
 import math
 import time
 import argparse
 import signal
 import sys
+from dataclasses import dataclass, field
 
+from dronekit import connect, VehicleMode, LocationGlobalRelative
 from pymavlink import mavutil
 
-# ─── Constants ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+CONTACT_THRESHOLD_M = 8.0
+COMMAND_INTERVAL_S  = 0.05
+DEFAULT_ALT_M       = 30.0
+EARTH_RADIUS_M      = 6_371_000.0
 
-EARTH_RADIUS_M     = 6_371_000.0
-PRONAV_RANGE_M     = 50.0
-RAM_RANGE_M        = 15.0
-CONTACT_M          = 8.0
-PRONAV_N           = 3.5
-PRONAV_LAT_CLAMP   = 6.0
-SPEED_CRUISE       = 25.0
-SPEED_APPROACH     = 20.0
-SPEED_PURSUIT      = 14.0
-SPEED_RAM          = 18.0
-TAKEOFF_ALT_M      = 15.0
-INTERCEPT_ALT_M    = 15.0
-GUIDANCE_DT_S      = 0.05
-VEL_TYPEMASK       = 0b0000_1100_0000_0111
+PRONAV_RANGE_M      = 50.0
+RAM_RANGE_M         = 15.0
+PRONAV_N            = 3.5
+PRONAV_CLAMP        = 6.0
 
-# ─── Geometry ─────────────────────────────────────────────────────
+SPEED_CRUISE        = 25.0
+SPEED_APPROACH      = 20.0
+SPEED_PURSUIT       = 14.0
+SPEED_RAM           = 18.0
+
+VEL_TYPEMASK = 0b0000_1100_0000_0111
+
+# ---------------------------------------------------------------------------
+# Geometry (same as v9)
+# ---------------------------------------------------------------------------
 
 def haversine_m(lat1, lon1, lat2, lon2):
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
-    return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    rlat1, rlon1 = math.radians(lat1), math.radians(lon1)
+    rlat2, rlon2 = math.radians(lat2), math.radians(lon2)
+    dlat, dlon = rlat2 - rlat1, rlon2 - rlon1
+    a = (math.sin(dlat/2)**2
+         + math.cos(rlat1)*math.cos(rlat2)*math.sin(dlon/2)**2)
+    return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 def bearing_deg(lat1, lon1, lat2, lon2):
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dlam = math.radians(lon2 - lon1)
-    x = math.sin(dlam) * math.cos(phi2)
-    y = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlam)
+    rlat1, rlon1 = math.radians(lat1), math.radians(lon1)
+    rlat2, rlon2 = math.radians(lat2), math.radians(lon2)
+    dlon = rlon2 - rlon1
+    x = math.sin(dlon) * math.cos(rlat2)
+    y = (math.cos(rlat1)*math.sin(rlat2)
+         - math.sin(rlat1)*math.cos(rlat2)*math.cos(dlon))
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
-def destination_point(lat, lon, brg_d, dist_m):
-    rlat, rlon, rb = math.radians(lat), math.radians(lon), math.radians(brg_d)
-    dr = dist_m / EARTH_RADIUS_M
-    nlat = math.asin(math.sin(rlat)*math.cos(dr) + math.cos(rlat)*math.sin(dr)*math.cos(rb))
-    nlon = rlon + math.atan2(math.sin(rb)*math.sin(dr)*math.cos(rlat),
-                              math.cos(dr) - math.sin(rlat)*math.sin(nlat))
-    return math.degrees(nlat), math.degrees(nlon)
+def destination_point(lat, lon, bearing_d, dist_m):
+    rlat, rlon = math.radians(lat), math.radians(lon)
+    rb = math.radians(bearing_d)
+    d_r = dist_m / EARTH_RADIUS_M
+    new_lat = math.asin(
+        math.sin(rlat)*math.cos(d_r)
+        + math.cos(rlat)*math.sin(d_r)*math.cos(rb))
+    new_lon = rlon + math.atan2(
+        math.sin(rb)*math.sin(d_r)*math.cos(rlat),
+        math.cos(d_r) - math.sin(rlat)*math.sin(new_lat))
+    return math.degrees(new_lat), math.degrees(new_lon)
 
 def wrap_180(a):
     return (a + 180) % 360 - 180
@@ -65,333 +90,287 @@ def speed_for_dist(d):
     if d > RAM_RANGE_M: return SPEED_PURSUIT
     return SPEED_RAM
 
-# ─── Simulated Targets ───────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Target (same as v9)
+# ---------------------------------------------------------------------------
 
-class Target:
-    def __init__(self, tid, lat, lon, alt, course, speed):
-        self.id = tid
-        self.lat = lat
-        self.lon = lon
-        self.alt = alt
-        self.course = course
-        self.speed = speed
-        self._t = time.time()
+@dataclass
+class SimTarget:
+    id: int
+    lat: float
+    lon: float
+    alt: float
+    course_deg: float
+    speed_mps: float
+    priority: int = 1
+    _last_update: float = field(default_factory=time.time, repr=False)
 
     def step(self):
         now = time.time()
-        dt = now - self._t
-        self._t = now
-        if dt > 0 and self.speed > 0:
-            self.lat, self.lon = destination_point(self.lat, self.lon, self.course, self.speed * dt)
+        dt = now - self._last_update
+        self._last_update = now
+        self.lat, self.lon = destination_point(
+            self.lat, self.lon, self.course_deg, self.speed_mps * dt)
 
-    def predict(self, t_sec):
-        return destination_point(self.lat, self.lon, self.course, self.speed * t_sec)
+    def predicted_position(self, t_sec):
+        return destination_point(
+            self.lat, self.lon, self.course_deg, self.speed_mps * t_sec)
 
     def reset_clock(self):
-        self._t = time.time()
+        self._last_update = time.time()
 
-def build_targets(hlat, hlon, alt):
-    targets = [
-        Target(1, hlat + 0.0008, hlon + 0.0005, alt, 45,  8),
-        Target(2, hlat - 0.0005, hlon + 0.0010, alt, 120, 5),
-        Target(3, hlat + 0.0012, hlon - 0.0003, alt, 315, 10),
-    ]
-    targets.sort(key=lambda t: haversine_m(hlat, hlon, t.lat, t.lon))
-    return targets
+# ---------------------------------------------------------------------------
+# v9 vehicle helpers (UNCHANGED)
+# ---------------------------------------------------------------------------
 
-# ─── Hybrid Guidance ──────────────────────────────────────────────
+def set_param(vehicle, name, value):
+    msg = vehicle.message_factory.param_set_encode(
+        0, 0, name.encode("utf-8"), value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    vehicle.send_mavlink(msg)
+    vehicle.flush()
 
-class Guidance:
+def force_speed_params(vehicle):
+    params = {
+        "ATC_ANGLE_MAX":  70.0,
+        "ATC_ANGLE_BOOST": 0.0,
+        "ATC_ACC_P_MAX":  2200.0,
+        "ATC_ACC_R_MAX":  2200.0,
+        "WP_SPD":         40.0,
+        "LOIT_SPEED_MS":  40.0,
+        "LOIT_ACC_MAX_M": 15.0,
+        "LOIT_BRK_ACC_M": 8.0,
+        "LOIT_BRK_DELAY": 0.1,
+        "LOIT_BRK_JRK_M": 15.0,
+        "MOT_THST_HOVER": 0.125,
+        "PSC_NE_VEL_P":   6.0,
+        "PSC_NE_VEL_I":   2.0,
+        "PSC_NE_POS_P":   2.0,
+        "PSC_JERK_NE":    20.0,
+    }
+    print("\n  Forcing params:")
+    for k, v in params.items():
+        set_param(vehicle, k, v)
+        print(f"    {k} = {v}")
+        time.sleep(0.2)
+    time.sleep(3)
+    print(f"\n  v10: velocity NED (no 14 m/s cap)")
+    print(f"  v10: PRONAV > PURSUIT > RAM\n")
+
+def wait_armable(vehicle, timeout=120):
+    print("  Waiting for armable ...")
+    t0 = time.time()
+    while not vehicle.is_armable:
+        if time.time() - t0 > timeout:
+            raise TimeoutError("Not armable")
+        time.sleep(0.5)
+    print("  Armable.")
+
+def arm_and_takeoff(vehicle, alt):
+    wait_armable(vehicle)
+    vehicle.mode = VehicleMode("GUIDED")
+    while vehicle.mode.name != "GUIDED":
+        time.sleep(0.3)
+    vehicle.armed = True
+    while not vehicle.armed:
+        time.sleep(0.3)
+    print("  Armed! Taking off ...")
+    vehicle.simple_takeoff(alt)
+    while True:
+        cur = vehicle.location.global_relative_frame.alt or 0
+        if cur >= alt * 0.95:
+            print(f"  Alt {cur:.1f} m -- takeoff done.\n")
+            break
+        time.sleep(0.5)
+
+# ---------------------------------------------------------------------------
+# NEW: Velocity NED command (replaces simple_goto)
+# ---------------------------------------------------------------------------
+
+def send_velocity_ned(vehicle, vn, ve, vd, yaw_rate=0):
+    msg = vehicle.message_factory.set_position_target_local_ned_encode(
+        0, 0, 0,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        VEL_TYPEMASK,
+        0, 0, 0,
+        vn, ve, vd,
+        0, 0, 0,
+        0, yaw_rate)
+    vehicle.send_mavlink(msg)
+    vehicle.flush()
+
+# ---------------------------------------------------------------------------
+# NEW: Hybrid Guidance (replaces ProNav-only)
+# ---------------------------------------------------------------------------
+
+class HybridGuidance:
     def __init__(self):
-        self.prev_los = None
-        self.prev_t = None
+        self._prev_los = None
+        self._prev_time = None
         self.phase = "INIT"
 
     def reset(self):
-        self.prev_los = None
-        self.prev_t = None
+        self._prev_los = None
+        self._prev_time = None
+        self.phase = "INIT"
 
-    def compute(self, mlat, mlon, malt, mvx, mvy, tgt):
-        dist = haversine_m(mlat, mlon, tgt.lat, tgt.lon)
+    def compute(self, drone_lat, drone_lon, drone_alt, drone_speed, target):
+        dist = haversine_m(drone_lat, drone_lon, target.lat, target.lon)
         now = time.time()
 
         if dist > PRONAV_RANGE_M:
             self.phase = "PRONAV"
-            mspd = math.sqrt(mvx**2 + mvy**2)
-            closing = max(mspd, 1.0) + tgt.speed
+            closing = max(drone_speed, 1.0) + target.speed_mps
             t_int = dist / closing
-            plat, plon = tgt.predict(t_int)
-            los = bearing_deg(mlat, mlon, plat, plon)
-            spd = speed_for_dist(dist)
-            lr = math.radians(los)
-            vn = spd * math.cos(lr)
-            ve = spd * math.sin(lr)
-            if self.prev_los is not None and self.prev_t is not None:
-                dt = now - self.prev_t
+            pred_lat, pred_lon = target.predicted_position(t_int)
+            los = bearing_deg(drone_lat, drone_lon, pred_lat, pred_lon)
+            speed = speed_for_dist(dist)
+            los_rad = math.radians(los)
+            vn = speed * math.cos(los_rad)
+            ve = speed * math.sin(los_rad)
+            if self._prev_los is not None and self._prev_time is not None:
+                dt = now - self._prev_time
                 if dt > 0.001:
-                    rate = wrap_180(los - self.prev_los) / dt
-                    alat = PRONAV_N * closing * math.radians(rate)
-                    alat = max(min(alat, PRONAV_LAT_CLAMP), -PRONAV_LAT_CLAMP)
-                    pr = lr + math.pi / 2
-                    vn += alat * math.cos(pr) * dt
-                    ve += alat * math.sin(pr) * dt
-            self.prev_los = los
-            self.prev_t = now
-            aerr = tgt.alt - malt
-            vd = -max(min(aerr * 1.0, 3.0), -3.0)
-            return vn, ve, vd, self.phase
+                    rate = wrap_180(los - self._prev_los) / dt
+                    a_lat = PRONAV_N * closing * math.radians(rate)
+                    a_lat = max(min(a_lat, PRONAV_CLAMP), -PRONAV_CLAMP)
+                    perp = los_rad + math.pi / 2
+                    vn += a_lat * math.cos(perp) * dt
+                    ve += a_lat * math.sin(perp) * dt
+            self._prev_los = los
+            self._prev_time = now
+            alt_err = target.alt - drone_alt
+            vd = -max(min(alt_err * 1.0, 3.0), -3.0)
+            return vn, ve, vd
 
         elif dist > RAM_RANGE_M:
             self.phase = "PURSUIT"
-            self.prev_los = None
-            self.prev_t = None
-            brg = bearing_deg(mlat, mlon, tgt.lat, tgt.lon)
-            spd = speed_for_dist(dist)
-            br = math.radians(brg)
-            vn = spd * math.cos(br)
-            ve = spd * math.sin(br)
-            aerr = tgt.alt - malt
-            vd = -max(min(aerr * 1.5, 4.0), -4.0)
-            return vn, ve, vd, self.phase
+            self._prev_los = None
+            self._prev_time = None
+            b = bearing_deg(drone_lat, drone_lon, target.lat, target.lon)
+            speed = speed_for_dist(dist)
+            br = math.radians(b)
+            vn = speed * math.cos(br)
+            ve = speed * math.sin(br)
+            alt_err = target.alt - drone_alt
+            vd = -max(min(alt_err * 1.5, 4.0), -4.0)
+            return vn, ve, vd
 
         else:
             self.phase = "RAM"
-            self.prev_los = None
-            self.prev_t = None
-            brg = bearing_deg(mlat, mlon, tgt.lat, tgt.lon)
-            br = math.radians(brg)
+            self._prev_los = None
+            self._prev_time = None
+            b = bearing_deg(drone_lat, drone_lon, target.lat, target.lon)
+            br = math.radians(b)
             vn = SPEED_RAM * math.cos(br)
             ve = SPEED_RAM * math.sin(br)
-            aerr = tgt.alt - malt
-            vd = -max(min(aerr * 2.0, 5.0), -5.0)
-            return vn, ve, vd, self.phase
+            alt_err = target.alt - drone_alt
+            vd = -max(min(alt_err * 2.0, 5.0), -5.0)
+            return vn, ve, vd
 
-# ─── Drone Controller ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Build targets — sorted nearest first
+# ---------------------------------------------------------------------------
 
-class Drone:
-    def __init__(self, conn_str):
-        print(f"[CONN] Connecting to {conn_str} ...")
-        self.mav = mavutil.mavlink_connection(conn_str)
-        self.mav.wait_heartbeat()
-        self.sid = self.mav.target_system
-        self.cid = self.mav.target_component
-        self.boot = time.time()
-        print(f"[CONN] Heartbeat OK — system {self.sid}")
+def build_targets(lat, lon):
+    targets = [
+        SimTarget(id=1, priority=1,
+                  lat=lat + 0.0008, lon=lon + 0.0005,
+                  alt=DEFAULT_ALT_M, course_deg=45, speed_mps=8),
+        SimTarget(id=2, priority=2,
+                  lat=lat - 0.0005, lon=lon + 0.0010,
+                  alt=DEFAULT_ALT_M, course_deg=120, speed_mps=5),
+        SimTarget(id=3, priority=3,
+                  lat=lat + 0.0012, lon=lon - 0.0003,
+                  alt=DEFAULT_ALT_M, course_deg=315, speed_mps=10),
+    ]
+    targets.sort(key=lambda t: haversine_m(lat, lon, t.lat, t.lon))
+    return targets
 
-        self._request_streams()
-        time.sleep(1)
+# ---------------------------------------------------------------------------
+# Main — v9 boot + v10 intercept
+# ---------------------------------------------------------------------------
 
-        print(f"[CONN] Waiting for GPS ...")
-        for i in range(60):
-            msg = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-            if msg and msg.lat != 0:
-                print(f"[CONN] GPS OK: {msg.lat/1e7:.6f}, {msg.lon/1e7:.6f}")
-                return
-            if i > 0 and i % 5 == 0:
-                print(f"[CONN]   ... {i}s, re-requesting streams")
-                self._request_streams()
-        print("[CONN] WARNING: No GPS after 60s, continuing")
+def run(conn):
+    print(f"Connecting to {conn} ...")
+    vehicle = connect(conn, wait_ready=True, heartbeat_timeout=60)
+    force_speed_params(vehicle)
 
-    def _request_streams(self):
-        for s in range(13):
-            self.mav.mav.request_data_stream_send(self.sid, self.cid, s, 10, 1)
+    def _sig(s, f):
+        print("\n[SIGINT] Landing ...")
+        vehicle.mode = VehicleMode("LAND")
+        time.sleep(2); vehicle.close(); sys.exit(0)
+    signal.signal(signal.SIGINT, _sig)
 
-    def _tms(self):
-        return int((time.time() - self.boot) * 1000)
+    arm_and_takeoff(vehicle, DEFAULT_ALT_M)
 
-    def get_pos(self):
-        msg = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-        if not msg:
-            return None
-        return {
-            "lat": msg.lat / 1e7, "lon": msg.lon / 1e7,
-            "alt": msg.relative_alt / 1000.0,
-            "vx": msg.vx / 100.0, "vy": msg.vy / 100.0, "vz": msg.vz / 100.0,
-        }
-
-    def set_mode(self, name):
-        modes = {"STABILIZE":0,"ACRO":1,"ALT_HOLD":2,"AUTO":3,
-                 "GUIDED":4,"LOITER":5,"RTL":6,"LAND":9}
-        mid = modes.get(name, 4)
-        for _ in range(20):
-            self.mav.set_mode_apm(mid)
-            hb = self.mav.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
-            if hb and hb.custom_mode == mid:
-                return True
-        return False
-
-    def arm_and_takeoff(self, alt_m):
-        print(f"[MODE] GUIDED")
-        self.set_mode("GUIDED")
-
-        print(f"[ARM] Arming ...")
-        self.mav.arducopter_arm()
-        self.mav.motors_armed_wait()
-        print(f"[ARM] Armed!")
-
-        print(f"[TAKEOFF] Target {alt_m}m")
-        self.mav.mav.command_long_send(
-            self.sid, self.cid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, alt_m)
-
-        t0 = time.time()
-        lp = 0
-        while True:
-            pos = self.get_pos()
-            now = time.time()
-            if pos:
-                a = pos["alt"]
-                if now - lp > 2:
-                    print(f"[TAKEOFF] {a:.1f}m / {alt_m}m")
-                    lp = now
-                if a >= alt_m * 0.85:
-                    print(f"[TAKEOFF] {a:.1f}m ✓ READY")
-                    return
-            else:
-                if now - lp > 3:
-                    print(f"[TAKEOFF] waiting for alt data ...")
-                    self._request_streams()
-                    lp = now
-            if now - t0 > 60:
-                print(f"[TAKEOFF] TIMEOUT — proceeding")
-                return
-            time.sleep(0.3)
-
-    def send_vel(self, vn, ve, vd, yr=0.0):
-        self.mav.mav.set_position_target_local_ned_send(
-            self._tms(), self.sid, self.cid,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED, VEL_TYPEMASK,
-            0, 0, 0, vn, ve, vd, 0, 0, 0, 0, yr)
-
-    def land(self):
-        print("[RTL] Returning ...")
-        self.set_mode("RTL")
-
-# ─── Force Params ─────────────────────────────────────────────────
-
-def force_params(mav):
-    params = {
-        "ATC_ANGLE_MAX": 70.0, "ATC_ANGLE_BOOST": 0.0,
-        "WP_SPD": 40.0, "LOIT_SPEED_MS": 40.0, "LOIT_ACC_MAX_M": 15.0,
-        "MOT_THST_HOVER": 0.125,
-        "PSC_NE_VEL_P": 6.0, "PSC_NE_VEL_I": 2.0,
-        "PSC_NE_POS_P": 2.0, "PSC_JERK_NE": 20.0,
-    }
-    print("\n  Setting params:")
-    for k, v in params.items():
-        mav.mav.param_set_send(mav.target_system, mav.target_component,
-                                k.encode('utf-8'), v, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-        print(f"    {k} = {v}")
-        time.sleep(0.1)
-    time.sleep(0.5)
-    print(f"  ✓ Velocity NED — no speed cap")
-    print(f"  ✓ ATC_ANGLE_MAX=70°\n")
-
-# ─── Logger ───────────────────────────────────────────────────────
-
-class Logger:
-    def __init__(self):
-        self.f = open("intercept_v10_log.csv", "w")
-        self.f.write("t,tgt,phase,dist,speed,vn,ve,vd,mlat,mlon,malt,tlat,tlon\n")
-
-    def log(self, tid, ph, d, s, vn, ve, vd, ml, mo, ma, tl, to):
-        self.f.write(f"{time.time():.3f},{tid},{ph},{d:.1f},{s:.1f},"
-                     f"{vn:.2f},{ve:.2f},{vd:.2f},"
-                     f"{ml:.7f},{mo:.7f},{ma:.1f},{tl:.7f},{to:.7f}\n")
-
-    def close(self):
-        self.f.close()
-
-# ─── Mission ──────────────────────────────────────────────────────
-
-def run(conn_str):
-    drone = Drone(conn_str)
-    force_params(drone.mav)
-
-    signal.signal(signal.SIGINT, lambda s, f: (drone.land(), time.sleep(2), sys.exit(0)))
-
-    drone.arm_and_takeoff(TAKEOFF_ALT_M)
-    time.sleep(1)
-
-    pos = drone.get_pos()
-    if not pos:
-        print("[ERROR] No position!")
-        return
-
-    targets = build_targets(pos["lat"], pos["lon"], INTERCEPT_ALT_M)
+    loc = vehicle.location.global_relative_frame
+    targets = build_targets(loc.lat, loc.lon)
     for t in targets:
         t.reset_clock()
-        d = haversine_m(pos["lat"], pos["lon"], t.lat, t.lon)
-        print(f"  T#{t.id}: {d:.0f}m, spd={t.speed}m/s, hdg={t.course}°")
+        d = haversine_m(loc.lat, loc.lon, t.lat, t.lon)
+        print(f"  Target #{t.id}: {d:.0f} m, speed {t.speed_mps} m/s, "
+              f"hdg {t.course_deg}")
 
-    guide = Guidance()
-    log = Logger()
+    guidance = HybridGuidance()
     active = list(targets)
     done = []
-    peak = 0.0
-
-    print()
-    print("=" * 50)
-    print("  INTERCEPT v10 — HUNTING")
-    print("  PRONAV > PURSUIT > RAM")
-    print("=" * 50)
-    print()
-
+    peak_gs = 0.0
     t0 = time.time()
 
-    while active:
-        pos = drone.get_pos()
-        if not pos:
-            time.sleep(0.01)
-            continue
+    print("\n" + "=" * 50)
+    print("  INTERCEPT v10 — HYBRID GUIDANCE")
+    print("  PRONAV > PURSUIT > RAM")
+    print("  Velocity NED — no speed cap")
+    print("=" * 50 + "\n")
 
-        ml, mo, ma = pos["lat"], pos["lon"], pos["alt"]
-        vx, vy = pos["vx"], pos["vy"]
-        gs = math.sqrt(vx**2 + vy**2)
-        peak = max(peak, gs)
+    while active:
+        loc = vehicle.location.global_relative_frame
+        gs = vehicle.groundspeed or 0.0
+        alt = loc.alt or 0.0
+        peak_gs = max(peak_gs, gs)
 
         for t in active:
             t.step()
 
-        tgt = min(active, key=lambda t: haversine_m(ml, mo, t.lat, t.lon))
-        dist = haversine_m(ml, mo, tgt.lat, tgt.lon)
+        tgt = min(active, key=lambda t: haversine_m(
+            loc.lat, loc.lon, t.lat, t.lon))
+        dist = haversine_m(loc.lat, loc.lon, tgt.lat, tgt.lon)
 
-        if dist <= CONTACT_M:
-            el = time.time() - t0
-            print(f"\n  *** INTERCEPT T#{tgt.id} d={dist:.1f}m "
-                  f"GS={gs:.1f}m/s t={el:.1f}s ***\n")
+        if dist <= CONTACT_THRESHOLD_M:
+            elapsed = time.time() - t0
+            print(f"\n  *** INTERCEPT #{tgt.id} d={dist:.1f}m "
+                  f"GS={gs:.1f}m/s t={elapsed:.1f}s ***\n")
             done.append(tgt.id)
             active.remove(tgt)
-            guide.reset()
+            guidance.reset()
             continue
 
-        vn, ve, vd, phase = guide.compute(ml, mo, ma, vx, vy, tgt)
+        vn, ve, vd = guidance.compute(loc.lat, loc.lon, alt, gs, tgt)
+        send_velocity_ned(vehicle, vn, ve, vd)
 
-        brg = bearing_deg(ml, mo, tgt.lat, tgt.lon)
-        hdg = (math.degrees(math.atan2(vy, vx)) + 360) % 360
-        yr = max(min(wrap_180(brg - hdg) * 0.05, 1.0), -1.0)
+        cmd_spd = math.sqrt(vn**2 + ve**2)
+        print(f"  T#{tgt.id} [{guidance.phase:7s}] "
+              f"d={dist:6.1f}m  GS={gs:5.1f}  "
+              f"cmd={cmd_spd:5.1f}  pk={peak_gs:.1f}")
 
-        drone.send_vel(vn, ve, vd, yr)
+        time.sleep(COMMAND_INTERVAL_S)
 
-        cs = math.sqrt(vn**2 + ve**2)
-        log.log(tgt.id, phase, dist, gs, vn, ve, vd, ml, mo, ma, tgt.lat, tgt.lon)
-        print(f"  T#{tgt.id} [{phase:7s}] d={dist:6.1f}m GS={gs:5.1f} cmd={cs:5.1f} pk={peak:.1f}")
-
-        time.sleep(GUIDANCE_DT_S)
-
-    log.close()
     elapsed = time.time() - t0
-    print()
-    print("=" * 50)
-    print(f"  DONE — {elapsed:.1f}s")
+    print(f"\n" + "=" * 50)
+    print(f"  MISSION COMPLETE -- {elapsed:.1f}s")
     print(f"  Intercepted: {done}")
-    print(f"  Peak speed: {peak:.1f} m/s")
-    print("=" * 50)
+    print(f"  Peak groundspeed: {peak_gs:.1f} m/s")
+    print("=" * 50 + "\n")
 
-    drone.land()
+    vehicle.mode = VehicleMode("RTL")
     time.sleep(5)
+    vehicle.close()
 
-if __name__ == "__main__":
+def main():
     p = argparse.ArgumentParser()
     p.add_argument("--connect", default="tcp:127.0.0.1:5760")
     run(p.parse_args().connect)
+
+if __name__ == "__main__":
+    main()
