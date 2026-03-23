@@ -28,8 +28,8 @@ from pymavlink import mavutil
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OVERSHOOT_DISTANCE_M: float = 100.0
-CONTACT_THRESHOLD_M: float = 10.0
+OVERSHOOT_DISTANCE_M: float = 30.0
+CONTACT_THRESHOLD_M: float = 15.0
 COMMAND_INTERVAL_S: float = 0.20
 DEFAULT_ALT_M: float = 30.0
 EARTH_RADIUS_M: float = 6_371_000.0
