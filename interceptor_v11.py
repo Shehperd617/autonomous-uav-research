@@ -10,7 +10,6 @@ KEPT FROM v10 (proven guidance):
 
 CHANGED FROM v10:
   1. Freestyle quad model params — unlocks 30+ m/s
-     (FRAME_CLASS=1, MOT_THST_EXPO=0.2, lower hover thrust,
       higher accel/jerk limits, aggressive angle max)
   2. Target priority: intercept-time weighted (dist / closing_rate)
      instead of nearest-first — chases fast targets early
@@ -135,12 +134,6 @@ def force_speed_params(vehicle):
     params = {
         # --- Freestyle frame physics ---
         "FRAME_CLASS":     1.0,       # quad
-        "MOT_THST_EXPO":   0.2,       # linear thrust curve
-        "MOT_THST_HOVER":  0.08,      # light hover = more headroom
-        "MOT_BAT_VOLT_MAX": 25.2,
-        "MOT_BAT_VOLT_MIN": 19.8,
-        "MOT_SPIN_MIN":    0.05,
-        "MOT_SPIN_MAX":    0.95,
         # --- Aggressive attitude ---
         "ATC_ANGLE_MAX":   80.0,      # 80° lean for speed
         "ATC_ANGLE_BOOST": 1.0,       # throttle boost in turns
