@@ -63,8 +63,8 @@ SPEED_PURSUIT      = 14.0    # 15m < dist < 50m   (pure pursuit)
 SPEED_RAM          = 18.0    # dist < 15m          (ram — overshoot OK)
 
 # Altitude
-TAKEOFF_ALT_M      = 30.0
-INTERCEPT_ALT_M    = 30.0
+TAKEOFF_ALT_M      = 15.0
+INTERCEPT_ALT_M    = 15.0
 
 # Timing
 GUIDANCE_DT_S      = 0.05    # 20 Hz guidance loop
@@ -368,10 +368,31 @@ class Drone:
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             0, 0, 0, 0, 0, 0, 0, alt_m)
 
+        t0 = time.time()
+        last_print = 0
         while True:
             pos = self.get_pos()
-            if pos and pos["alt"] >= alt_m * 0.90:
-                print(f"[TAKEOFF] {pos['alt']:.1f}m ✓")
+            now = time.time()
+            if pos:
+                alt = pos["alt"]
+                # Print every 2 seconds
+                if now - last_print > 2:
+                    print(f"[TAKEOFF] alt={alt:.1f}m / {alt_m}m ...")
+                    last_print = now
+                if alt >= alt_m * 0.85:
+                    print(f"[TAKEOFF] {alt:.1f}m ✓")
+                    return
+            else:
+                if now - last_print > 5:
+                    print(f"[TAKEOFF] Waiting for position data ...")
+                    last_print = now
+                    # Re-request streams
+                    for sid in range(13):
+                        self.mav.mav.request_data_stream_send(
+                            self.sys_id, self.comp_id, sid, 10, 1)
+            # Timeout after 90s
+            if now - t0 > 90:
+                print(f"[TAKEOFF] TIMEOUT — proceeding anyway")
                 return
             time.sleep(0.5)
 
