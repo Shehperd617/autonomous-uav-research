@@ -1,98 +1,179 @@
-# Autonomous UAV Intercept Simulation
+# SPEAR — Smart Pursuit & Engagement Autonomous Response
 
-ArduPilot SITL simulation for autonomous navigation and intercept of moving virtual targets.
+A solo undergraduate research project on autonomous drone-vs-drone interception
+using YOLO-based perception, Kalman filtering, and Augmented Proportional
+Navigation guidance. Validated across 8,000 simulated engagements at four
+adversarial difficulty tiers.
 
-## The Problem
+![SPEAR Geometric Wall](gazebo_sim/baselines/spear_geometric_wall.png)
 
-MAVLink `SET_POSITION_TARGET_GLOBAL_INT` velocity commands are ignored by ArduCopter's position controller in GUIDED mode — the drone reports 0 m/s groundspeed and cannot close distance below ~22 m to a moving waypoint.
+## Headline Results
 
-## The Fix: Overshoot Navigation
+| Scenario                     | Hit Rate | Median Miss | Median Time |
+|------------------------------|----------|-------------|-------------|
+| Passive target               | 100.0%   | 0.68 m      | 4.0 s       |
+| Easy evader (break turns)    | 100.0%   | 0.65 m      | 5.5 s       |
+| Medium evader (random jinks) | 100.0%   | 0.99 m      | 5.7 s       |
+| Hard evader (predictive)     | 3.3%     | 1.67 m      | 12.6 s      |
+| + perception noise           | 57.7%    | 1.46 m      | 13.5 s      |
 
-Instead of commanding velocities, we use `simple_goto` aimed at a point **50 m past** the predicted target position. This means:
+All results at 1.5 m strict hit threshold. 1000 randomized engagements per
+scenario. Initial separations 50-200 m, target speeds 5-12 m/s base with
+22 m/s burst maneuvers.
 
-- The flight controller always has a distant waypoint ahead and never triggers deceleration.
-- The drone flies *through* the target coordinates at full cruise speed.
-- Contact is registered when the drone passes within 10 m of the target.
+## Key Finding: The Geometric Wall
 
-## Architecture
+Against optimally predictive equal-speed evaders, the SPEAR guidance system
+converges to a 1.67 m geometric floor — characterized to within 20 cm — at
+which point reactive guidance is fundamentally blocked. The interceptor
+arrives at the correct intercept point, but the predictive evader (which
+observes the interceptor's projected path) dodges in the final 50-100 ms.
 
-```
-┌─────────────────────────────────────────────────┐
-│                  Guidance Loop                   │
-│  (runs every 0.25 s)                            │
-│                                                  │
-│  1. Update all SimTarget positions               │
-│  2. Select highest-priority target (nearest tie) │
-│  3. Estimate time-to-intercept                   │
-│  4. Predict target position at intercept time    │
-│  5. Apply ProNav bearing correction              │
-│  6. Project overshoot point 50 m past prediction │
-│  7. Issue simple_goto to overshoot point         │
-│  8. Check contact (< 10 m → intercept)           │
-└─────────────────────────────────────────────────┘
-```
+Paradoxically, perception noise improves hit rate on this tier by 17×
+(3.3% → 57.7%) by desynchronizing the adversarial feedback loop — a
+phenomenon known as adversarial decorrelation. When the interceptor sees a
+slightly wrong target position and commits to a slightly wrong aim point,
+the evader's optimal-perpendicular dodge is no longer perpendicular to the
+actual approach. Noise becomes an obfuscation layer.
 
-### Proportional Navigation (ProNav)
+This is not a bug. It is a fundamental limit of reactive guidance against
+an information-symmetric adversary, and it is the central research finding
+of the project.   ## Controlled Experiment: Stochastic Guidance Kernel
 
-The bearing to the aim point is corrected by the line-of-sight (LOS) rate:
+To test whether adversarial decorrelation is the dominant failure mechanism
+on the hard tier, we introduced a controlled stochastic guidance kernel:
+gaussian jitter applied to the interceptor's aim-point estimate, with
+magnitude swept across six values from 0 m to 1 m. 6,000 additional Monte
+Carlo engagements were run on hard mode at the strict 1.5 m hit threshold.
 
-```
-commanded_bearing = LOS_bearing + N × LOS_rate × dt
-```
+![Stochastic Guidance Sweep](gazebo_sim/baselines/spear_jitter_sweep.png)
 
-where **N = 3** (navigation gain). This biases the flight path toward the future intercept point, reducing the pursuit curve.
+| Aim Jitter (σ) | Hit Rate | Median Miss |
+|----------------|----------|-------------|
+| 0.00 m         |  3.3%    | 1.67 m      |
+| 0.05 m         |  4.1%    | 1.69 m      |
+| 0.10 m         |  7.3%    | 1.71 m      |
+| 0.20 m         | 16.0%    | 1.72 m      |
+| 0.50 m         | 34.8%    | 1.65 m      |
+| 1.00 m         | **63.3%**| 1.40 m      |
 
-### Priority-Based Target Selection
+**Result:** Hit rate climbs monotonically from 3.3% to 63.3% as jitter
+increases — a 19× improvement — and at 1 m jitter the controlled kernel
+*exceeds* the 57.7% hit rate produced by free-running perception noise.
+This confirms adversarial decorrelation as the dominant failure mechanism
+on the hard tier and demonstrates that deliberate guidance variance is a
+viable mitigation against optimally predictive evaders.
 
-Targets carry an integer priority (lower = more important). The selector picks:
-1. Lowest priority number first.
-2. Among equal priorities, the nearest target wins.
+**Mechanism:** Median miss distance stays near 1.7 m for low-to-moderate
+jitter while hit rate climbs steeply. This indicates the kernel works by
+*widening the outcome distribution* rather than by bias correction —
+more engagements land in the lucky tail that falls inside the 1.5 m
+threshold. Variance injection, not solution improvement.
 
-Once a target is intercepted (distance < 10 m), it is removed and the next target is selected.
+## System Architecture
 
-## Files
+**Perception** — YOLOv11s detector trained on 47,000 hand-labeled images,
+97.6% mAP@0.5 on the validation set. Currently fed oracle pose data in
+simulation; transitions to live camera input when the ELP 2.3MP global
+shutter camera is integrated.
 
-| File | Purpose |
-|---|---|
-| `interceptor_v9.py` | Main simulation script (guidance, nav, targets) |
-| `intercept_params.parm` | Custom ArduPilot parameters for fast navigation |
-| `launch_sim.sh` | One-command launcher: starts SITL + runs script |
+**State estimation** — 6-state Extended Kalman Filter `[x,y,z,vx,vy,vz]`
+with constant-velocity motion model, fixed process noise (q_vel=25.0),
+soft innovation gating for outlier rejection during long-range cruise,
+disabled gating in terminal phase for smooth state estimates. Acceleration
+estimate exposed via heavily smoothed and clipped finite difference of
+velocity history.
 
-## Quick Start
+**Guidance** — Augmented Proportional Navigation with N=4.5, terminal lead
+pursuit, and a terminal speed boost (22 → 40 m/s when R < 18 m) modeling
+realistic FPV terminal dive behavior. APN augmentation gated to short
+time-to-go to prevent unbounded long-range extrapolation.
 
+**Simulation** — Headless Python physics harness simulating engagements at
+~1000× real-time. Four evader difficulty tiers and an optional perception
+noise model (0.5 m gaussian jitter, 5% dropout, 100 ms latency) for
+realism. Live Gazebo Fortress visualization available via separate
+ROS 2 bridge for demonstration.
+
+## Project Layout
+autonomous-uav-research/
+├── README.md
+├── gazebo_sim/
+│   ├── two_drone_world.sdf          # Gazebo world definition
+│   ├── spear_ros2_bridge.py         # Live demo controller (v17)
+│   ├── spear_monte_carlo.py         # Headless engagement harness (v5.2)
+│   ├── plot_wall.py                 # Result visualization
+│   └── baselines/                   # All Monte Carlo CSVs + final plots
+└── perception/                      # YOLO training artifacts
+## Reproducing the Results
+
+Live demo (Gazebo Fortress + ROS 2 Humble):
 ```bash
-# 1. Make sure ArduPilot SITL tools are on PATH
-source ~/ardupilot/Tools/environment_install/install-prereqs-ubuntu.sh
+# Terminal 1
+cd gazebo_sim && ign gazebo two_drone_world.sdf  # press Play
 
-# 2. Launch everything
-chmod +x launch_sim.sh
-bash launch_sim.sh
+# Terminal 2 — ROS 2 bridge
+source /opt/ros/humble/setup.bash
+ros2 run ros_gz_bridge parameter_bridge \
+  /model/interceptor/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist \
+  /model/target/cmd_vel@geometry_msgs/msg/Twist@ignition.msgs.Twist \
+  /world/spear_intercept/dynamic_pose/info@tf2_msgs/msg/TFMessage@ignition.msgs.Pose_V
+
+# Terminal 3 — controller
+source /opt/ros/humble/setup.bash
+cd gazebo_sim && python3 spear_ros2_bridge.py
 ```
 
-Or run the pieces separately:
-
+Monte Carlo characterization (no Gazebo, ~3 minutes for 8000 engagements):
 ```bash
-# Terminal 1 — SITL
-sim_vehicle.py -v ArduCopter --no-mavproxy \
-    --add-param-file=intercept_params.parm
-
-# Terminal 2 — intercept script
-python3 interceptor_v9.py --connect tcp:127.0.0.1:5760
+cd gazebo_sim
+python3 spear_monte_carlo.py -n 1000 -m passive --strict --ekf --apn --quiet -o mc_passive.csv
+python3 spear_monte_carlo.py -n 1000 -m easy    --strict --ekf --apn --quiet -o mc_easy.csv
+python3 spear_monte_carlo.py -n 1000 -m medium  --strict --ekf --apn --quiet -o mc_medium.csv
+python3 spear_monte_carlo.py -n 1000 -m hard    --strict --ekf --apn --quiet -o mc_hard.csv
+python3 spear_monte_carlo.py -n 1000 -m passive --noise --strict --ekf --apn --quiet -o mc_passive_n.csv
+python3 spear_monte_carlo.py -n 1000 -m easy    --noise --strict --ekf --apn --quiet -o mc_easy_n.csv
+python3 spear_monte_carlo.py -n 1000 -m medium  --noise --strict --ekf --apn --quiet -o mc_medium_n.csv
+python3 spear_monte_carlo.py -n 1000 -m hard    --noise --strict --ekf --apn --quiet -o mc_hard_n.csv
+python3 plot_wall.py
 ```
 
-## Key Parameters (intercept_params.parm)
+## Development History
 
-| Parameter | Value | Why |
-|---|---|---|
-| `WPNAV_SPEED` | 1500 (15 m/s) | High cruise speed for intercept |
-| `WPNAV_ACCEL` | 400 (4 m/s²) | Fast acceleration to cruise |
-| `WPNAV_RADIUS` | 200 (2 m) | Tight acceptance radius |
-| `LOIT_BRK_DELAY` | 0.1 s | Near-instant braking when needed |
-| `THR_MIN` | 130 | Maintains speed through turns |
+The current Monte Carlo harness is the result of iterative debugging across
+multiple versions, each measured against the same baseline matrix:
 
-## Tuning
+- **v17** (live Gazebo bridge) — Lead pursuit + low-pass velocity filter.
+  Scored 100% hit rate but 21.9 s median time-to-intercept on hard targets
+  via slow asymptotic chase.
+- **v3** (Monte Carlo harness with realistic evaders + 1.5 m strict hit
+  sphere) — Established the honest baseline. Revealed v17's "100% hit rate"
+  on hard mode was a 22-second drag race, not a real interception.
+- **v4 / v4.1 / v4.2** (6-state EKF) — Replaced low-pass filter with
+  Kalman filter. Reduced ZEM 3-5× on noisy scenarios. Tuned process noise
+  and innovation gating across three iterations.
+- **v5 / v5.1 / v5.2** (Augmented PN + terminal speed boost) — Added APN
+  acceleration term and terminal dive behavior. v5 catastrophically broke
+  passive (68%) due to unbounded quadratic lead extrapolation; v5.1 added
+  tgo-gating and acceleration clipping; v5.2 tuned terminal phase parameters
+  to crush 6 of 8 scenarios.
 
-- **OVERSHOOT_DISTANCE_M** (default 50): Increase if the drone still decelerates before contact. Decrease for tighter turning at the cost of possible premature braking.
-- **CONTACT_THRESHOLD_M** (default 10): The "kill radius." Smaller values require more precise guidance.
-- **NAV_GAIN** (default 3.0): ProNav constant N. Higher values steer more aggressively toward the predicted intercept. Values above 4-5 can cause oscillation.
-- **COMMAND_INTERVAL_S** (default 0.25): How often the guidance loop re-aims. Faster updates improve tracking but add MAVLink traffic.
+The hard-mode failure in v5.2 led to the geometric wall finding above.
+
+## Roadmap
+
+**Hardware integration** — ELP 2.3MP global shutter USB camera (on order).
+The EKF is ready to swap its input from oracle pose to YOLO bounding box
+center + monocular depth estimate with no architectural changes.
+
+**Stochastic guidance kernel** — ✅ Completed. See "Controlled Experiment"
+section above. Hit rate on hard mode climbed from 3.3% to 63.3% with 1 m
+of aim-point jitter, exceeding the perception-noise baseline.
+
+**Real flight test** — Outdoor pursuit-evasion test with two physical
+quadcopters once perception pipeline is integrated.
+
+## Author
+
+Solo undergraduate research project. All code, training data, simulation
+infrastructure, and analysis by the author.

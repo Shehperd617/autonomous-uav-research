@@ -1,2 +1,90 @@
-eeprom.bin
+# ============ TRAINING DATA & MODELS (8 GB) ============
+drone_training/
+runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.cache
+
+# ============ FLIGHT LOGS (552 MB) ============
 logs/
+*.BIN
+*.tlog
+*.tlog.raw
+*.parm
+mav.parm
+mav.tlog*
+
+# ============ VIDEOS ============
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# ============ ARDUCOPTER RUNTIME ============
+eeprom.bin
+sitl.log
+dumpcore.sh_*
+dumpstack.sh_*
+terrain/
+0/
+1/
+gazebo_frames/
+
+# ============ WSL / WINDOWS METADATA ============
+*:Zone.Identifier
+
+# ============ PYTHON ============
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ============ EDITOR / OS ============
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# ============ MISC ============
+*.log
+nohup.out
+intercept_trajectory.png
+v4_closerange/
+
+# ============ OLD SPEAR EXPERIMENTS ============
+# Keep only the final versions in gazebo_sim/
+spear_v16.py
+spear_v18.py
+spear_v19.py
+spear_v20.py
+spear_v21.py
+spear_v22.py
+spear_v23.py
+spear_v23_final.py
+spear_v24_fixes.py
+the_spear_v14.py
+interceptor_v11.py
+interceptor_v12.py
+spear_v17.py
+chaos_target.py
+optical_flow_los.py
+detection_diagnostic.py
+make_video.py
+vision_test.py
+train_drone_model.py
+spear_vision.py
+hud.py
+guidance.py
+tracking.py
+detection.py
+config.py
+ekf6.py
+main.py
+
+# ============ NESTED REPO (looks accidental) ============
+autonomous-uav-research/
