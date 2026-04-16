@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SPEAR Bridge v2.6 — SENSOR FUSION + STABLE HUNT + POST-HIT RE-ENGAGE.
+SPEAR Bridge v3.0 — CUED LAUNCH + SENSOR FUSION.
 
 CHANGES FROM v2.5:
   - Acoustic bearing now read as WORLD frame (no body conversion).
@@ -32,13 +32,18 @@ except ImportError:
 
 # ============ CONFIG ============
 WAYPOINTS = [
-    (50, 25, 20), (45, 30, 20), (40, 22, 20),
-    (48, 28, 20), (42, 25, 20), (46, 23, 20),
-    (44, 27, 20), (49, 24, 20), (43, 29, 20),
+    (50, 25, 20), (55, 20, 21), (52, 28, 19),
+    (48, 22, 21), (53, 26, 20), (50, 18, 20),
+    (47, 24, 21), (54, 22, 19), (51, 27, 20),
 ]
 TGT_SPD = 4.0
 TGT_SPD_FAST = 5.0
-WP_THR = 5.0
+WP_THR = 3.0
+
+# ============ LAUNCH CONFIG ============
+LAUNCH_NOISE_DEG = 7.0      # launcher bearing noise (degrees)
+LAUNCH_SPEED = 22.0         # launch velocity (m/s)
+LAUNCH_MAX_TIME = 3.0       # max time in LAUNCH state
 HIT_DIST = 3.0
 N_PN = 4.5
 INT_SPD = 22.0
@@ -64,7 +69,7 @@ SEARCH_MIN_DIST = 1.5
 ACOUSTIC_STALE_THRESHOLD = 1.0
 ACOUSTIC_MIN_SIGNAL = 0.05
 
-ALT_MIN = 5.0
+ALT_MIN = 10.0
 ALT_MAX = 30.0
 
 
@@ -225,7 +230,7 @@ class ProNav3D:
 # ============ NODE ============
 class SpearNodeV2(Node):
     def __init__(self, use_vision=False):
-        super().__init__('spear_bridge_v2')
+        super().__init__('spear_bridge_v3')
         self.use_vision = use_vision
         self.shutdown_requested = False
 
@@ -282,11 +287,12 @@ class SpearNodeV2(Node):
         self.last_tv = np.zeros(3)
         self.armed = True
 
-        self.state = "TRACKING"
-        self.search_entered_t = None
+        self.state = "LAUNCH"
+        self.launch_bearing = None
+        self.launch_t = None
 
         mode = "VISION (closed-loop YOLO)" if use_vision else "ORACLE (cheating TF)"
-        self.get_logger().info(f"SPEAR v2.6 — {CONTROL_HZ}Hz — mode: {mode}")
+        self.get_logger().info(f"SPEAR v3.0 — {CONTROL_HZ}Hz — mode: {mode}")
         self.get_logger().info(f"EKF measurement noise std: {meas_noise:.3f}m")
         self.get_logger().info(
             f"State thresholds: COASTING>{STALE_THRESHOLD}s  "
@@ -408,13 +414,10 @@ class SpearNodeV2(Node):
             if chase_dist > SEARCH_MIN_DIST:
                 return (chase_vec / chase_dist) * SEARCH_CHASE_SPEED, "LK"
             return np.zeros(3), "LK"
-        # PRIORITY 3: cold start
-        patrol_center = np.array([45.0, 25.0, 20.0])
-        seek_vec = patrol_center - ip
-        seek_dist = np.linalg.norm(seek_vec)
-        if seek_dist > 5.0:
-            return (seek_vec / seek_dist) * SEARCH_CHASE_SPEED, "CS"
-        return np.zeros(3), "CS"
+        # PRIORITY 3: continue on launch bearing
+        if self.launch_bearing is not None:
+            return self.launch_bearing * SEARCH_CHASE_SPEED, "LB"
+        return np.zeros(3), "NONE"
 
     def tick(self):
         el_t = time.time() - self.t0
@@ -428,6 +431,21 @@ class SpearNodeV2(Node):
 
         ip = self.int_pos.copy()
         tp_oracle = self.tgt_pos_oracle.copy()
+# Compute launch bearing on first tick
+        if self.launch_bearing is None:
+            true_dir = tp_oracle - ip
+            true_dist = np.linalg.norm(true_dir)
+            if true_dist > 0.1:
+                true_unit = true_dir / true_dist
+                noise_rad = math.radians(LAUNCH_NOISE_DEG)
+                az = math.atan2(true_dir[1], true_dir[0]) + np.random.normal(0, noise_rad)
+                el = math.atan2(true_dir[2], math.sqrt(true_dir[0]**2 + true_dir[1]**2)) + np.random.normal(0, noise_rad)
+                self.launch_bearing = np.array([math.cos(el)*math.cos(az), math.cos(el)*math.sin(az), math.sin(el)])
+                err = math.degrees(math.acos(np.clip(np.dot(true_unit, self.launch_bearing), -1, 1)))
+                self.get_logger().info(f"LAUNCH BEARING: err={err:.1f}° range={true_dist:.1f}m")
+            else:
+                self.launch_bearing = np.array([1.0, 0.0, 0.0])
+            self.launch_t = el_t
 
         # Target waypoint chase
         w = np.array(WAYPOINTS[self.wp])
@@ -576,7 +594,7 @@ def main():
 
     print("=" * 60)
     mode = "VISION (closed-loop)" if args.vision else "ORACLE (baseline)"
-    print(f"  SPEAR v2.6 — SENSOR FUSION (vision + acoustic) — mode: {mode}")
+    print(f"  SPEAR v3.0 — SENSOR FUSION (vision + acoustic) — mode: {mode}")
     print("=" * 60)
 
     rclpy.init()
