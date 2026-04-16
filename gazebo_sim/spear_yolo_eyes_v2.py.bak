@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-SPEAR YOLO Eyes v2.1 — perception with magenta color gate + HSV fallback.
+SPEAR YOLO Eyes v2 — full perception pipeline.
 
 Stage 1: Subscribes to camera, runs YOLO, displays annotated feed.
 Stage 2: Subscribes to interceptor pose, runs the full math chain
          (bbox -> camera -> body -> world) on every detection, and
          publishes the world-frame target position estimate.
 
-NEW in v2.1:
-  - Target is now magenta (pink). YOLO detections are accepted only if
-    the bbox interior is >30% magenta pixels in HSV space. This rejects
-    grass false positives and the red interceptor.
-  - HSV fallback: if YOLO returns no boxes, the node runs a direct
-    magenta blob detector on the frame. Whichever finds the target first
-    wins. This makes perception robust even if the YOLO weights were
-    never trained on the current Gazebo target geometry.
-
 Publishes:
     /spear/target_estimate    geometry_msgs/PoseStamped
+                              (world-frame target position; orientation
+                               unused for now, set to identity)
 
 Subscribes:
     /interceptor/camera                              sensor_msgs/Image
@@ -44,52 +37,39 @@ MODEL_PATH = Path.home() / "autonomous-uav-research" / "spear_drone_v3.pt"
 CAMERA_TOPIC = "/interceptor/camera"
 POSE_TOPIC = "/world/spear_intercept/dynamic_pose/info"
 TARGET_ESTIMATE_TOPIC = "/spear/target_estimate"
-CONF_THRESHOLD = 0.25
-WINDOW_NAME = "SPEAR Interceptor View [YOLO v2.1]"
+CONF_THRESHOLD = 0.35
+WINDOW_NAME = "SPEAR Interceptor View [YOLO v2]"
 HOLD_DURATION = 0.5
 
 CAPTURE_DIR = Path.home() / "autonomous-uav-research" / "gazebo_sim" / "baselines" / "yolo_captures"
 
-# Camera intrinsics (HFOV = 120 deg = 2.0944 rad, 640x480)
-HFOV = 2.0944
-FX = 184.75
+# Camera intrinsics derived from SDF HFOV = 1.39626
+HFOV = 2.0944    
+FX = 184.75      
 FY = 184.75
 CX = 320.0
 CY = 240.0
+# Target physical width in meters (from SDF box: 0.4 0.4 0.1)
+TARGET_REAL_WIDTH = 0.4
 
-# Target physical width in meters — MUST match SDF box size.
-# SDF body is 1.4 x 1.4 x 0.32 so the visible width is 1.4.
-TARGET_REAL_WIDTH = 1.0
-
-# Camera mount on body (from SDF camera pose)
+# Camera mount on body (from SDF camera pose 0.25 0 -0.02 0 0 0)
 T_CAM_IN_BODY = np.array([0.25, 0.0, -0.02])
 
-# Camera frame -> Body frame rotation
+# Camera frame -> Body frame rotation (constant, frame convention only)
 R_CAM_TO_BODY = np.array([
     [ 0,  0,  1],
     [-1,  0,  0],
     [ 0, -1,  0],
 ], dtype=float)
 
-# ---- MAGENTA COLOR GATE ----
-# HSV range for the SDF material (1.0, 0.0, 1.0) magenta.
-# OpenCV hue is 0-179. Magenta sits around 140-170.
-MAGENTA_HSV_LO = np.array([140,  80,  80], dtype=np.uint8)
-MAGENTA_HSV_HI = np.array([175, 255, 255], dtype=np.uint8)
-# A YOLO bbox is kept only if at least this fraction of its pixels are magenta.
-MAGENTA_MIN_FRAC = 0.30
-# HSV fallback: minimum blob area in pixels to count as a detection.
-HSV_MIN_BLOB_AREA = 15
-MIN_BBOX_WIDTH_FOR_RANGE = 3   
-
 
 # ============ MATH HELPERS ============
 def bbox_to_camera_position(x1, y1, x2, y2):
-    """Bbox in pixels -> 3D target position in camera frame (meters).
-    Returns None if bbox is too small for reliable range estimation."""
+    """Bbox in pixels -> 3D target position in camera frame (meters)."""
     bbox_w = abs(x2 - x1)
-    if bbox_w < MIN_BBOX_WIDTH_FOR_RANGE:
+    if bbox_w < 1.0:
         return None
+    # Bearing
     u = (x1 + x2) / 2.0
     v = (y1 + y2) / 2.0
     x = (u - CX) / FX
@@ -97,6 +77,7 @@ def bbox_to_camera_position(x1, y1, x2, y2):
     z = 1.0
     ray = np.array([x, y, z])
     ray = ray / np.linalg.norm(ray)
+    # Range
     rng = FX * TARGET_REAL_WIDTH / bbox_w
     return ray * rng
 
@@ -122,48 +103,6 @@ def body_to_world(p_body, int_pos, int_quat):
     return R @ np.asarray(p_body, dtype=float) + np.asarray(int_pos, dtype=float)
 
 
-def magenta_fraction_in_bbox(frame_bgr, x1, y1, x2, y2):
-    """Fraction of pixels inside the bbox that match the magenta HSV range."""
-    h, w = frame_bgr.shape[:2]
-    x1c = max(0, min(w - 1, x1))
-    x2c = max(0, min(w,     x2))
-    y1c = max(0, min(h - 1, y1))
-    y2c = max(0, min(h,     y2))
-    if x2c <= x1c or y2c <= y1c:
-        return 0.0
-    roi = frame_bgr[y1c:y2c, x1c:x2c]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, MAGENTA_HSV_LO, MAGENTA_HSV_HI)
-    total = mask.size
-    if total == 0:
-        return 0.0
-    return float(cv2.countNonZero(mask)) / float(total)
-
-
-def hsv_fallback_detect(frame_bgr):
-    """Direct magenta blob detector. Returns (x1,y1,x2,y2,conf) or None."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, MAGENTA_HSV_LO, MAGENTA_HSV_HI)
-    # Clean up noise
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                            np.ones((3, 3), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                            np.ones((5, 5), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    # Pick the biggest blob
-    biggest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(biggest)
-    if area < HSV_MIN_BLOB_AREA:
-        return None
-    x, y, w, h = cv2.boundingRect(biggest)
-    # Synthesize a confidence from blob area (capped at 0.99)
-    conf = min(0.99, 0.50 + area / 20000.0)
-    return (x, y, x + w, y + h, float(conf))
-
-
 # ============ NODE ============
 class SpearEyesV2(Node):
     def __init__(self):
@@ -178,32 +117,26 @@ class SpearEyesV2(Node):
         self.get_logger().info(
             f"Camera intrinsics: fx=fy={FX:.2f} cx={CX} cy={CY}"
         )
-        self.get_logger().info(
-            f"TARGET_REAL_WIDTH={TARGET_REAL_WIDTH}m  "
-            f"magenta_gate>={MAGENTA_MIN_FRAC:.2f}"
-        )
 
         CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 
         self.bridge = CvBridge()
 
-        # Interceptor pose state
-        self.interceptor_pos = None
-        self.interceptor_quat = None
+        # Interceptor pose state (updated by pose callback)
+        self.interceptor_pos = None      # np.array([x, y, z]) or None
+        self.interceptor_quat = None     # np.array([w, x, y, z]) or None
         self.pose_msgs_received = 0
 
         # Frame stats
         self.frame_count = 0
         self.detection_count = 0
-        self.yolo_raw_count = 0
-        self.yolo_kept_count = 0
-        self.hsv_hit_count = 0
         self.publish_count = 0
         self.last_log_time = time.time()
         self.last_fps_frames = 0
         self.held_boxes = []
         self.held_until = 0.0
         self.best_conf_seen = 0.0
+        self.captures_saved = 0
 
         # Subscribers
         self.sub_image = self.create_subscription(
@@ -224,8 +157,10 @@ class SpearEyesV2(Node):
         cv2.resizeWindow(WINDOW_NAME, 800, 600)
 
     def on_pose(self, msg: TFMessage):
+        """Extract interceptor pose from the world TF message."""
         self.pose_msgs_received += 1
         for tf in msg.transforms:
+            # The interceptor entity is named "interceptor" in the SDF
             if tf.child_frame_id == "interceptor":
                 t = tf.transform.translation
                 r = tf.transform.rotation
@@ -246,47 +181,28 @@ class SpearEyesV2(Node):
         self.frame_count += 1
         now = time.time()
 
-        # ---- Stage A: YOLO + magenta gate ----
+        # Run YOLO
         results = self.model(frame, conf=CONF_THRESHOLD, verbose=False)
-        kept_boxes = []   # boxes that PASS the magenta gate
+        new_boxes = []
         max_conf = 0.0
         best_box = None
-        best_source = None
-
         for r in results:
             if r.boxes is None:
                 continue
             for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 conf = float(box.conf[0])
-                self.yolo_raw_count += 1
-                frac = magenta_fraction_in_bbox(frame, x1, y1, x2, y2)
-                if frac < MAGENTA_MIN_FRAC:
-                    # Rejected — not magenta enough
-                    continue
-                self.yolo_kept_count += 1
-                label = f"YOLO {conf:.2f} m{frac:.2f}"
-                kept_boxes.append((x1, y1, x2, y2, conf, label))
+                cls_id = int(box.cls[0])
+                cls_name = self.model.names.get(cls_id, str(cls_id))
+                label = f"{cls_name} {conf:.2f}"
+                new_boxes.append((x1, y1, x2, y2, conf, label))
                 if conf > max_conf:
                     max_conf = conf
                     best_box = (x1, y1, x2, y2)
-                    best_source = "YOLO"
                 self.detection_count += 1
 
-        # ---- Stage B: HSV fallback if YOLO found nothing usable ----
-        if best_box is None:
-            fb = hsv_fallback_detect(frame)
-            if fb is not None:
-                fx1, fy1, fx2, fy2, fconf = fb
-                label = f"HSV {fconf:.2f}"
-                kept_boxes.append((fx1, fy1, fx2, fy2, fconf, label))
-                best_box = (fx1, fy1, fx2, fy2)
-                max_conf = fconf
-                best_source = "HSV"
-                self.hsv_hit_count += 1
-                self.detection_count += 1
-
-        # ---- Stage C: publish target estimate ----
+        # If we got a detection AND we have a current interceptor pose,
+        # run the math chain and publish.
         published_this_frame = False
         target_world = None
         if best_box is not None and self.interceptor_pos is not None:
@@ -300,16 +216,16 @@ class SpearEyesV2(Node):
                 published_this_frame = True
                 self.publish_count += 1
 
-        # Held-detection visualization
-        if kept_boxes:
-            self.held_boxes = kept_boxes
+        # Held-detection visualization (unchanged from v1)
+        if new_boxes:
+            self.held_boxes = new_boxes
             self.held_until = now + HOLD_DURATION
         if max_conf > self.best_conf_seen and max_conf > 0:
             self.best_conf_seen = max_conf
 
         if now < self.held_until:
             draw_boxes = self.held_boxes
-            box_color = (0, 255, 0) if kept_boxes else (0, 200, 200)
+            box_color = (0, 255, 0) if new_boxes else (0, 200, 200)
         else:
             draw_boxes = []
             self.held_boxes = []
@@ -325,21 +241,19 @@ class SpearEyesV2(Node):
             self.last_fps_frames = self.frame_count
             pose_status = "OK" if self.interceptor_pos is not None else "MISSING"
             self.get_logger().info(
-                f"frames={self.frame_count} fps={fps:.1f} "
-                f"yolo_raw={self.yolo_raw_count} yolo_kept={self.yolo_kept_count} "
-                f"hsv={self.hsv_hit_count} pub={self.publish_count} "
-                f"best={self.best_conf_seen:.2f} pose={pose_status}"
+                f"frames={self.frame_count} det={self.detection_count} "
+                f"published={self.publish_count} fps={fps:.1f} "
+                f"best_conf={self.best_conf_seen:.2f} pose={pose_status}"
             )
 
         # HUD
-        hud1 = (f"frame {self.frame_count}  live_det {len(kept_boxes)}  "
+        hud1 = (f"frame {self.frame_count}  live_det {len(new_boxes)}  "
                 f"published {self.publish_count}")
-        hud2 = (f"yolo_kept {self.yolo_kept_count}  hsv {self.hsv_hit_count}  "
-                f"best {self.best_conf_seen:.2f}  "
+        hud2 = (f"best_conf {self.best_conf_seen:.2f}  "
                 f"pose {'OK' if self.interceptor_pos is not None else 'WAIT'}")
         if target_world is not None:
             hud3 = (f"target_world: ({target_world[0]:.1f}, "
-                    f"{target_world[1]:.1f}, {target_world[2]:.1f}) [{best_source}]")
+                    f"{target_world[1]:.1f}, {target_world[2]:.1f})")
         else:
             hud3 = "target_world: --"
         cv2.putText(annotated, hud1, (10, 25),
@@ -361,7 +275,7 @@ class SpearEyesV2(Node):
         msg.pose.position.x = float(p_world[0])
         msg.pose.position.y = float(p_world[1])
         msg.pose.position.z = float(p_world[2])
-        msg.pose.orientation.w = 1.0
+        msg.pose.orientation.w = 1.0  # identity, orientation unused
         self.pub_target.publish(msg)
 
     def _draw_boxes(self, img, boxes, color=(0, 255, 0)):

@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
-SPEAR Bridge v2.6 — SENSOR FUSION + STABLE HUNT + POST-HIT RE-ENGAGE.
-
-CHANGES FROM v2.5:
-  - Acoustic bearing now read as WORLD frame (no body conversion).
-    Eliminates oscillation and "flying backward" during HUNT.
-  - Post-hit cooldown ends with immediate re-engagement: spear acts
-    on whichever sensor is fresh (vision > acoustic > last-known)
-    instead of sitting still until the next state transition.
+SPEAR Bridge v2.4 — AGGRESSIVE HUNTER.
 
 3-state machine:
   TRACKING  : vision fresh, full ProNav
   COASTING  : vision stale 0.5-1.5s, half-speed ProNav on EKF predict
-  SEARCHING : vision lost. Use acoustic world-bearing to fly toward
-              target. Vision homes when reacquired.
+  SEARCHING : vision lost, FULL-SPEED chase to last known target position
+              + yaw scan. Altitude capped at 30m to prevent skyward drift.
 """
 import sys
-import math
 import time
 import argparse
 import numpy as np
@@ -24,7 +16,7 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
-    from geometry_msgs.msg import Twist, PoseStamped, Vector3
+    from geometry_msgs.msg import Twist, PoseStamped
     from tf2_msgs.msg import TFMessage
 except ImportError:
     print("Run: source /opt/ros/humble/setup.bash")
@@ -32,12 +24,12 @@ except ImportError:
 
 # ============ CONFIG ============
 WAYPOINTS = [
-    (80, 50, 25), (70, 40, 22), (60, 35, 20),
-    (50, 30, 18), (40, 25, 18), (30, 20, 18),
-    (40, 30, 20), (60, 40, 22), (80, 50, 25),
+    (50, 20, 20), (30, 10, 18), (10, 5, 16),
+    (0, 20, 18), (-10, -5, 20), (-20, 15, 15),
+    (-15, 5, 10), (-5, 10, 22), (10, 15, 17),
 ]
-TGT_SPD = 4.0
-TGT_SPD_FAST = 5.0
+TGT_SPD = 8.0
+TGT_SPD_FAST = 11.0
 WP_THR = 5.0
 HIT_DIST = 3.0
 N_PN = 4.5
@@ -48,22 +40,23 @@ FREEZE_TICKS = 15
 REARM_DIST = 12.0
 LEAD_GAIN = 0.8
 
+# EKF noise
 EKF_Q_POS = 0.5
 EKF_Q_VEL = 25.0
 EKF_R_BASE = 0.05
 EKF_VISION_NOISE_STD = 1.0
 EKF_ORACLE_NOISE_STD = 0.05
 
+# Staleness thresholds
 STALE_THRESHOLD = 0.5
 LOST_THRESHOLD = 1.5
 
-SEARCH_CHASE_SPEED = 22.0
-SEARCH_YAW_RATE = 0.6
-SEARCH_MIN_DIST = 1.5
+# SEARCH behavior (v2.4 — full-speed hunter)
+SEARCH_CHASE_SPEED = 22.0       # m/s, full INT_SPD — aggressive hunt
+SEARCH_YAW_RATE = 0.6           # rad/s, ~34 deg/s, scan while chasing
+SEARCH_MIN_DIST = 1.5           # if closer than this, just hover and scan
 
-ACOUSTIC_STALE_THRESHOLD = 1.0
-ACOUSTIC_MIN_SIGNAL = 0.05
-
+# Altitude safety cap (prevents flying into the sky during search)
 ALT_MIN = 5.0
 ALT_MAX = 30.0
 
@@ -240,14 +233,10 @@ class SpearNodeV2(Node):
         self.tgt_pos_vision = None
         self.vision_count = 0
         self.last_vision_t = None
-        self.last_known_tgt_pos = None
 
-        # Acoustic state — now WORLD FRAME
-        self.acoustic_az_world = None
-        self.acoustic_el_world = None
-        self.acoustic_signal = 0.0
-        self.acoustic_count = 0
-        self.last_acoustic_t = None
+        # Frozen "last known target position" for SEARCH
+        # This is the most recent vision detection — never extrapolated
+        self.last_known_tgt_pos = None
 
         meas_noise = (EKF_VISION_NOISE_STD if use_vision
                       else EKF_ORACLE_NOISE_STD)
@@ -262,10 +251,6 @@ class SpearNodeV2(Node):
                 PoseStamped,
                 '/spear/target_estimate',
                 self.vision_cb, 10)
-        self.acoustic_sub = self.create_subscription(
-            Vector3,
-            '/spear/acoustic_bearing',
-            self.acoustic_cb, 10)
 
         self.cmd_timer = self.create_timer(1.0 / CONTROL_HZ, self.tick)
         self.pub_timer = self.create_timer(0.05, self.republish)
@@ -286,14 +271,16 @@ class SpearNodeV2(Node):
         self.search_entered_t = None
 
         mode = "VISION (closed-loop YOLO)" if use_vision else "ORACLE (cheating TF)"
-        self.get_logger().info(f"SPEAR v2.6 — {CONTROL_HZ}Hz — mode: {mode}")
+        self.get_logger().info(f"SPEAR v2.4 — {CONTROL_HZ}Hz — mode: {mode}")
         self.get_logger().info(f"EKF measurement noise std: {meas_noise:.3f}m")
         self.get_logger().info(
             f"State thresholds: COASTING>{STALE_THRESHOLD}s  "
             f"SEARCHING>{LOST_THRESHOLD}s")
         self.get_logger().info(
-            "SEARCH: world-frame acoustic cueing (no oscillation)")
-        self.get_logger().info(f"Altitude cap: {ALT_MIN}-{ALT_MAX}m")
+            f"SEARCH: HUNTER mode - chase to last-known at "
+            f"{SEARCH_CHASE_SPEED} m/s + yaw scan")
+        self.get_logger().info(
+            f"Altitude cap: {ALT_MIN}-{ALT_MAX}m")
 
     def pose_cb(self, msg):
         for tf in msg.transforms:
@@ -312,32 +299,8 @@ class SpearNodeV2(Node):
         self.vision_count += 1
         self.last_vision_t = time.time() - self.t0
 
-    def acoustic_cb(self, msg):
-        if msg.z < ACOUSTIC_MIN_SIGNAL:
-            return
-        self.acoustic_az_world = msg.x
-        self.acoustic_el_world = msg.y
-        self.acoustic_signal = msg.z
-        self.acoustic_count += 1
-        self.last_acoustic_t = time.time() - self.t0
-
-    def acoustic_fresh(self, t):
-        if self.last_acoustic_t is None:
-            return False
-        return (t - self.last_acoustic_t) < ACOUSTIC_STALE_THRESHOLD
-
-    def acoustic_world_velocity(self, speed):
-        """Convert WORLD (az, el) bearing -> world-frame velocity."""
-        az = self.acoustic_az_world
-        el = self.acoustic_el_world
-        if az is None or el is None:
-            return None
-        cx = math.cos(el) * math.cos(az)
-        cy = math.cos(el) * math.sin(az)
-        cz = math.sin(el)
-        return np.array([cx, cy, cz]) * speed
-
     def apply_altitude_cap(self, ip, v):
+        """Prevent the drone from flying out of the safe altitude band."""
         if ip[2] >= ALT_MAX and v[2] > 0:
             v = v.copy()
             v[2] = 0
@@ -390,34 +353,8 @@ class SpearNodeV2(Node):
         else:
             return "SEARCHING"
 
-    def compute_search_velocity(self, ip, el_t):
-        """Compute velocity for SEARCHING state. Returns (iv, src_tag).
-
-        Priority: acoustic > last-known > cold-start fallback.
-        Used both during normal SEARCHING and post-HIT re-engagement.
-        """
-        # PRIORITY 1: acoustic
-        if self.acoustic_fresh(el_t) and self.acoustic_az_world is not None:
-            iv = self.acoustic_world_velocity(SEARCH_CHASE_SPEED)
-            if iv is not None:
-                return iv, "ACC"
-        # PRIORITY 2: last-known vision position
-        if self.last_known_tgt_pos is not None:
-            chase_vec = self.last_known_tgt_pos - ip
-            chase_dist = np.linalg.norm(chase_vec)
-            if chase_dist > SEARCH_MIN_DIST:
-                return (chase_vec / chase_dist) * SEARCH_CHASE_SPEED, "LK"
-            return np.zeros(3), "LK"
-        # PRIORITY 3: cold start
-        patrol_center = np.array([0.0, 10.0, 18.0])
-        seek_vec = patrol_center - ip
-        seek_dist = np.linalg.norm(seek_vec)
-        if seek_dist > 5.0:
-            return (seek_vec / seek_dist) * SEARCH_CHASE_SPEED, "CS"
-        return np.zeros(3), "CS"
-
     def tick(self):
-        el_t = time.time() - self.t0
+        el = time.time() - self.t0
 
         if self.int_pos is None or self.tgt_pos_oracle is None:
             if self.lp % 20 == 0:
@@ -445,31 +382,42 @@ class SpearNodeV2(Node):
         self.last_tv = (d / dn) * s if dn > 0.1 else np.zeros(3)
 
         # === EKF update ===
-        meas, has_new = self.get_target_measurement(el_t)
+        meas, has_new = self.get_target_measurement(el)
 
         # State transition logic
-        new_state = self.compute_state(el_t)
+        new_state = self.compute_state(el)
         if new_state != self.state:
-            age = (el_t - self.last_vision_t) if self.last_vision_t else -1
+            age = (el - self.last_vision_t) if self.last_vision_t else -1
             self.get_logger().warn(
                 f"State: {self.state} -> {new_state}  "
-                f"(age={age:.2f}s  vis={self.vision_count} "
-                f"acc={self.acoustic_count})")
+                f"(age={age:.2f}s  vis_count={self.vision_count})")
 
             if self.state == "SEARCHING" and new_state == "TRACKING":
-                self.get_logger().warn("EKF RESET — fresh vision lock")
+                self.get_logger().warn(
+                    "EKF RESET — fresh start from new vision detection")
                 self.ekf.reset()
                 self.nav.reset()
 
             if new_state == "SEARCHING":
-                self.search_entered_t = el_t
+                self.search_entered_t = el
 
             self.state = new_state
 
+        # Run EKF
         if has_new:
-            tp_filtered, tv_filtered = self.ekf.step_with_measurement(meas, el_t)
+            tp_filtered, tv_filtered = self.ekf.step_with_measurement(meas, el)
         else:
-            tp_filtered, tv_filtered = self.ekf.step_predict_only(el_t)
+            tp_filtered, tv_filtered = self.ekf.step_predict_only(el)
+
+        if tp_filtered is None:
+            self.last_iv = np.zeros(3)
+            self.last_iv_angular = np.zeros(3)
+            if self.lp % 20 == 0:
+                self.get_logger().warn(
+                    f"EKF uninitialized — waiting for first measurement "
+                    f"(vision_count={self.vision_count})")
+            self.lp += 1
+            return
 
         sep_true = np.linalg.norm(tp_oracle - ip)
 
@@ -481,13 +429,6 @@ class SpearNodeV2(Node):
             if self.cd == 0:
                 self.nav.reset()
                 self.armed = True
-                # POST-HIT RE-ENGAGE: don't sit still, immediately
-                # compute a search velocity using whatever sensor is fresh.
-                iv, src = self.compute_search_velocity(ip, el_t)
-                iv = self.apply_altitude_cap(ip, iv)
-                self.last_iv = iv
-                self.last_iv_angular = np.array([0.0, 0.0, SEARCH_YAW_RATE])
-                self._search_src = f"REENG-{src}"
         else:
             if not self.armed and sep_true > REARM_DIST:
                 self.armed = True
@@ -495,34 +436,48 @@ class SpearNodeV2(Node):
             if not self.armed:
                 self.last_iv = np.zeros(3)
                 self.last_iv_angular = np.zeros(3)
-
             elif self.state == "SEARCHING":
-                iv, src = self.compute_search_velocity(ip, el_t)
+                # HUNTER MODE: chase last-KNOWN target position at full speed.
+                if self.last_known_tgt_pos is not None:
+                    chase_vec = self.last_known_tgt_pos - ip
+                    chase_dist = np.linalg.norm(chase_vec)
+                    if chase_dist > SEARCH_MIN_DIST:
+                        chase_dir = chase_vec / chase_dist
+                        iv = chase_dir * SEARCH_CHASE_SPEED
+                    else:
+                        iv = np.zeros(3)
+                else:
+                    # Cold start: no vision yet. Fly toward the middle of
+                    # the waypoint patrol volume and yaw-scan to find target.
+                    patrol_center = np.array([0.0, 10.0, 18.0])
+                    seek_vec = patrol_center - ip
+                    seek_dist = np.linalg.norm(seek_vec)
+                    if seek_dist > 5.0:
+                        iv = (seek_vec / seek_dist) * SEARCH_CHASE_SPEED
+                    else:
+                        iv = np.zeros(3)
                 iv = self.apply_altitude_cap(ip, iv)
                 self.last_iv = iv
                 self.last_iv_angular = np.array([0.0, 0.0, SEARCH_YAW_RATE])
-                self._search_src = src
             else:
-                # TRACKING or COASTING
-                if tp_filtered is None:
-                    self.last_iv = np.zeros(3)
-                    self.last_iv_angular = np.zeros(3)
-                else:
-                    iv = self.nav.compute(ip, tp_filtered, el_t,
-                                           ekf_tgt_vel=tv_filtered)
-                    if self.state == "COASTING":
-                        iv = iv * 0.5
-                    if self.state == "TRACKING" and sep_true > 80.0:
-                        chase = tp_filtered - ip
-                        cn = np.linalg.norm(chase)
-                        if cn > 1.0:
-                            iv = (chase / cn) * INT_SPD
-                    sp = np.linalg.norm(iv)
-                    if sp > INT_SPD * 1.5:
-                        iv = iv / sp * INT_SPD * 1.5
-                    iv = self.apply_altitude_cap(ip, iv)
-                    self.last_iv = iv
-                    self.last_iv_angular = np.zeros(3)
+                # TRACKING or COASTING: run guidance
+                iv = self.nav.compute(ip, tp_filtered, el,
+                                       ekf_tgt_vel=tv_filtered)
+                if self.state == "COASTING":
+                    iv = iv * 0.5
+
+                if self.state == "TRACKING" and sep_true > 80.0:
+                    chase = tp_filtered - ip
+                    cn = np.linalg.norm(chase)
+                    if cn > 1.0:
+                        iv = (chase / cn) * INT_SPD
+
+                sp = np.linalg.norm(iv)
+                if sp > INT_SPD * 1.5:
+                    iv = iv / sp * INT_SPD * 1.5
+                iv = self.apply_altitude_cap(ip, iv)
+                self.last_iv = iv
+                self.last_iv_angular = np.zeros(3)
 
         # Hit detection
         if sep_true < HIT_DIST and self.cd == 0 and self.armed:
@@ -532,9 +487,9 @@ class SpearNodeV2(Node):
             self.last_iv = np.zeros(3)
             self.last_iv_angular = np.zeros(3)
             self.get_logger().info(
-                f"*** HIT#{self.hits} t={el_t:.1f}s sep={sep_true:.1f}m ***")
+                f"*** HIT#{self.hits} t={el:.1f}s sep={sep_true:.1f}m ***")
 
-        # Status log
+        # Status
         if self.lp % 10 == 0:
             ph = "PN" if sep_true >= TERMINAL_R else "TM"
             if self.cd > 0:
@@ -542,25 +497,20 @@ class SpearNodeV2(Node):
             elif not self.armed:
                 ph = "RST"
             elif self.state == "SEARCHING":
-                ph = f"HUNT-{getattr(self, '_search_src', '?')}"
+                ph = "HUNT"
             elif self.state == "COASTING":
                 ph = "COAST"
-
-            est_err = (np.linalg.norm(tp_filtered - tp_oracle)
-                       if tp_filtered is not None else -1.0)
-
-            if (self.use_vision and est_err > 50.0
-                    and self.state != "TRACKING"):
+            est_err = np.linalg.norm(tp_filtered - tp_oracle)
+            # EKF divergence gate: if estimate is wildly off, force reset
+            if self.use_vision and est_err > 50.0 and self.state != "TRACKING":
                 self.get_logger().warn(
                     f"EKF DIVERGED (err={est_err:.0f}m) — forcing reset")
                 self.ekf.reset()
                 self.nav.reset()
-
             mode_tag = "V" if self.use_vision else "O"
-            extra = (f"vis={self.vision_count} acc={self.acoustic_count} "
-                     f"alt={ip[2]:.0f}") if self.use_vision else ""
+            extra = f"vis={self.vision_count} alt={ip[2]:.0f}" if self.use_vision else ""
             self.get_logger().info(
-                f"t={el_t:5.1f}s [{mode_tag}] Sep:{sep_true:5.1f}m "
+                f"t={el:5.1f}s [{mode_tag}] Sep:{sep_true:5.1f}m "
                 f"EstErr:{est_err:.2f}m Vc={self.nav.Vc:+.1f} "
                 f"ZEM={self.nav.zem:.1f} [{ph}] WP:{self.wp} "
                 f"H:{self.hits} {extra}"
@@ -576,7 +526,7 @@ def main():
 
     print("=" * 60)
     mode = "VISION (closed-loop)" if args.vision else "ORACLE (baseline)"
-    print(f"  SPEAR v2.6 — SENSOR FUSION (vision + acoustic) — mode: {mode}")
+    print(f"  SPEAR v2.4 — HUNTER MODE — mode: {mode}")
     print("=" * 60)
 
     rclpy.init()
@@ -590,8 +540,7 @@ def main():
         rate = node.hits / max(el, 1) * 60
         print(f"\n  {node.hits} hits in {el:.0f}s ({rate:.1f}/min)")
         if args.vision:
-            print(f"  Vision detections: {node.vision_count}")
-            print(f"  Acoustic detections: {node.acoustic_count}")
+            print(f"  Vision detections received: {node.vision_count}")
 
         node.shutdown_requested = True
         try:

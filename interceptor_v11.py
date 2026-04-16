@@ -1,402 +1,223 @@
 #!/usr/bin/env python3
-"""
-Interceptor v11 — Speed unlock + smart target priority
-=======================================================
-KEPT FROM v10 (proven guidance):
-  - dronekit connect/arm/takeoff — UNCHANGED
-  - PRONAV → PURSUIT → RAM hybrid guidance — UNCHANGED
-  - velocity NED commands — UNCHANGED
-  - same CLI interface (--connect)
-
-CHANGED FROM v10:
-  1. Freestyle quad model params — unlocks 30+ m/s
-      higher accel/jerk limits, aggressive angle max)
-  2. Target priority: intercept-time weighted (dist / closing_rate)
-     instead of nearest-first — chases fast targets early
-  3. Re-sort after each intercept so priority stays optimal
-"""
-
-from __future__ import annotations
-
-import math
 import time
+import math
 import argparse
-import signal
-import sys
-from dataclasses import dataclass, field
-
 from dronekit import connect, VehicleMode, LocationGlobalRelative
-from pymavlink import mavutil
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-CONTACT_THRESHOLD_M = 8.0
-COMMAND_INTERVAL_S  = 0.05
-DEFAULT_ALT_M       = 30.0
-EARTH_RADIUS_M      = 6_371_000.0
+# --- CONSTANTS & FAILSAFES ---
+MAX_FLIGHT_RADIUS_M = 2000.0  # Geofence boundary
+INTERCEPT_RADIUS_M = 15.0     # Strike distance
+N_CONST = 4.0                 # ProNav Navigation Constant
+MIN_ALT_M = 10.0              # Hard deck altitude failsafe
+CRIT_VOLTAGE = 14.0           # Failsafe voltage (set for 4S in SITL, change to 21.0 for 6S IRL)
 
-PRONAV_RANGE_M      = 50.0
-RAM_RANGE_M         = 15.0
-PRONAV_N            = 3.5
-PRONAV_CLAMP        = 6.0
+def get_distance_meters(aLocation1, aLocation2):
+    dlat = aLocation2.lat - aLocation1.lat
+    dlong = aLocation2.lon - aLocation1.lon
+    return math.sqrt((dlat*dlat) + (dlong*dlong)) * 1.113195e5
 
-SPEED_CRUISE        = 25.0
-SPEED_APPROACH      = 20.0
-SPEED_PURSUIT       = 14.0
-SPEED_RAM           = 18.0
+def get_bearing(aLocation1, aLocation2):
+    off_x = aLocation2.lon - aLocation1.lon
+    off_y = aLocation2.lat - aLocation1.lat
+    bearing = 90.00 + math.atan2(-off_y, off_x) * 57.2957795
+    if bearing < 0:
+        bearing += 360.00
+    return bearing
 
-VEL_TYPEMASK = 0b0000_1100_0000_0111
+def get_local_xy(home_loc, curr_loc):
+    x = (curr_loc.lon - home_loc.lon) * 111319.5 * math.cos(math.radians(home_loc.lat))
+    y = (curr_loc.lat - home_loc.lat) * 111319.5
+    return x, y
 
-# ---------------------------------------------------------------------------
-# Geometry (same as v9)
-# ---------------------------------------------------------------------------
+def set_attitude_thrust(vehicle, roll_deg, pitch_deg, yaw_deg, thrust):
+    roll = math.radians(roll_deg)
+    pitch = math.radians(pitch_deg)
+    yaw = math.radians(yaw_deg)
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    rlat1, rlon1 = math.radians(lat1), math.radians(lon1)
-    rlat2, rlon2 = math.radians(lat2), math.radians(lon2)
-    dlat, dlon = rlat2 - rlat1, rlon2 - rlon1
-    a = (math.sin(dlat/2)**2
-         + math.cos(rlat1)*math.cos(rlat2)*math.sin(dlon/2)**2)
-    return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    cr2 = math.cos(roll * 0.5)
+    cp2 = math.cos(pitch * 0.5)
+    cy2 = math.cos(yaw * 0.5)
+    sr2 = math.sin(roll * 0.5)
+    sp2 = math.sin(pitch * 0.5)
+    sy2 = math.sin(yaw * 0.5)
 
-def bearing_deg(lat1, lon1, lat2, lon2):
-    rlat1, rlon1 = math.radians(lat1), math.radians(lon1)
-    rlat2, rlon2 = math.radians(lat2), math.radians(lon2)
-    dlon = rlon2 - rlon1
-    x = math.sin(dlon) * math.cos(rlat2)
-    y = (math.cos(rlat1)*math.sin(rlat2)
-         - math.sin(rlat1)*math.cos(rlat2)*math.cos(dlon))
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
+    q = [
+        cr2 * cp2 * cy2 + sr2 * sp2 * sy2,
+        sr2 * cp2 * cy2 - cr2 * sp2 * sy2,
+        cr2 * sp2 * cy2 + sr2 * cp2 * sy2,
+        cr2 * cp2 * sy2 - sr2 * sp2 * cy2
+    ]
 
-def destination_point(lat, lon, bearing_d, dist_m):
-    rlat, rlon = math.radians(lat), math.radians(lon)
-    rb = math.radians(bearing_d)
-    d_r = dist_m / EARTH_RADIUS_M
-    new_lat = math.asin(
-        math.sin(rlat)*math.cos(d_r)
-        + math.cos(rlat)*math.sin(d_r)*math.cos(rb))
-    new_lon = rlon + math.atan2(
-        math.sin(rb)*math.sin(d_r)*math.cos(rlat),
-        math.cos(d_r) - math.sin(rlat)*math.sin(new_lat))
-    return math.degrees(new_lat), math.degrees(new_lon)
-
-def wrap_180(a):
-    return (a + 180) % 360 - 180
-
-def speed_for_dist(d):
-    if d > 200: return SPEED_CRUISE
-    if d > PRONAV_RANGE_M: return SPEED_APPROACH
-    if d > RAM_RANGE_M: return SPEED_PURSUIT
-    return SPEED_RAM
-
-# ---------------------------------------------------------------------------
-# Target (same as v9)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SimTarget:
-    id: int
-    lat: float
-    lon: float
-    alt: float
-    course_deg: float
-    speed_mps: float
-    priority: int = 1
-    _last_update: float = field(default_factory=time.time, repr=False)
-
-    def step(self):
-        now = time.time()
-        dt = now - self._last_update
-        self._last_update = now
-        self.lat, self.lon = destination_point(
-            self.lat, self.lon, self.course_deg, self.speed_mps * dt)
-
-    def predicted_position(self, t_sec):
-        return destination_point(
-            self.lat, self.lon, self.course_deg, self.speed_mps * t_sec)
-
-    def reset_clock(self):
-        self._last_update = time.time()
-
-# ---------------------------------------------------------------------------
-# v9 vehicle helpers (UNCHANGED)
-# ---------------------------------------------------------------------------
-
-def set_param(vehicle, name, value):
-    msg = vehicle.message_factory.param_set_encode(
-        0, 0, name.encode("utf-8"), value,
-        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    msg = vehicle.message_factory.set_attitude_target_encode(
+        0, 1, 1, 7, q, 0, 0, 0, thrust
+    )
     vehicle.send_mavlink(msg)
-    vehicle.flush()
 
-def force_speed_params(vehicle):
-    params = {
-        # --- Freestyle frame physics ---
-        "FRAME_CLASS":     1.0,       # quad
-        # --- Aggressive attitude ---
-        "ATC_ANGLE_MAX":   80.0,      # 80° lean for speed
-        "ATC_ANGLE_BOOST": 1.0,       # throttle boost in turns
-        "ATC_ACC_P_MAX":   3000.0,
-        "ATC_ACC_R_MAX":   3000.0,
-        "ATC_RAT_PIT_P":   0.135,
-        "ATC_RAT_RLL_P":   0.135,
-        # --- Position / velocity controller ---
-        "PSC_NE_VEL_P":    8.0,
-        "PSC_NE_VEL_I":    3.0,
-        "PSC_NE_POS_P":    3.0,
-        "PSC_JERK_NE":     30.0,
-        "PSC_VELXY_FLTD":  10.0,
-        # --- Loiter / WP (fallback) ---
-        "WP_SPD":          50.0,
-        "LOIT_SPEED_MS":   50.0,
-        "LOIT_ACC_MAX_M":  20.0,
-        "LOIT_BRK_ACC_M":  10.0,
-        "LOIT_BRK_DELAY":  0.05,
-        "LOIT_BRK_JRK_M":  20.0,
-        # --- Throttle ---
-        "THR_MAX":          1.0,
-        "THR_MID":          0.15,
-    }
-    print("\n  Forcing params (freestyle unlock):")
-    for k, v in params.items():
-        set_param(vehicle, k, v)
-        print(f"    {k} = {v}")
-        time.sleep(0.15)
-    time.sleep(3)
-    print(f"\n  v11: freestyle params → target 30+ m/s")
-    print(f"  v11: intercept-time priority (fast targets first)")
-    print(f"  v11: PRONAV > PURSUIT > RAM\n")
-
-def wait_armable(vehicle, timeout=120):
+def arm_and_takeoff(vehicle, aTargetAltitude):
     print("  Waiting for armable ...")
-    t0 = time.time()
     while not vehicle.is_armable:
-        if time.time() - t0 > timeout:
-            raise TimeoutError("Not armable")
-        time.sleep(0.5)
+        time.sleep(1)
     print("  Armable.")
-
-def arm_and_takeoff(vehicle, alt):
-    wait_armable(vehicle)
     vehicle.mode = VehicleMode("GUIDED")
-    while vehicle.mode.name != "GUIDED":
-        time.sleep(0.3)
     vehicle.armed = True
     while not vehicle.armed:
-        time.sleep(0.3)
+        time.sleep(1)
     print("  Armed! Taking off ...")
-    vehicle.simple_takeoff(alt)
+    vehicle.simple_takeoff(aTargetAltitude)
     while True:
-        cur = vehicle.location.global_relative_frame.alt or 0
-        if cur >= alt * 0.95:
-            print(f"  Alt {cur:.1f} m -- takeoff done.\n")
+        alt = vehicle.location.global_relative_frame.alt
+        if alt >= aTargetAltitude * 0.95:
+            print(f"  Alt {alt:.1f} m -- takeoff done.\n")
             break
-        time.sleep(0.5)
-
-# ---------------------------------------------------------------------------
-# NEW: Velocity NED command (replaces simple_goto)
-# ---------------------------------------------------------------------------
-
-def send_velocity_ned(vehicle, vn, ve, vd, yaw_rate=0):
-    msg = vehicle.message_factory.set_position_target_local_ned_encode(
-        0, 0, 0,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        VEL_TYPEMASK,
-        0, 0, 0,
-        vn, ve, vd,
-        0, 0, 0,
-        0, yaw_rate)
-    vehicle.send_mavlink(msg)
-    vehicle.flush()
-
-# ---------------------------------------------------------------------------
-# NEW: Hybrid Guidance (replaces ProNav-only)
-# ---------------------------------------------------------------------------
-
-class HybridGuidance:
-    def __init__(self):
-        self._prev_los = None
-        self._prev_time = None
-        self.phase = "INIT"
-
-    def reset(self):
-        self._prev_los = None
-        self._prev_time = None
-        self.phase = "INIT"
-
-    def compute(self, drone_lat, drone_lon, drone_alt, drone_speed, target):
-        dist = haversine_m(drone_lat, drone_lon, target.lat, target.lon)
-        now = time.time()
-
-        if dist > PRONAV_RANGE_M:
-            self.phase = "PRONAV"
-            closing = max(drone_speed, 1.0) + target.speed_mps
-            t_int = dist / closing
-            pred_lat, pred_lon = target.predicted_position(t_int)
-            los = bearing_deg(drone_lat, drone_lon, pred_lat, pred_lon)
-            speed = speed_for_dist(dist)
-            los_rad = math.radians(los)
-            vn = speed * math.cos(los_rad)
-            ve = speed * math.sin(los_rad)
-            if self._prev_los is not None and self._prev_time is not None:
-                dt = now - self._prev_time
-                if dt > 0.001:
-                    rate = wrap_180(los - self._prev_los) / dt
-                    a_lat = PRONAV_N * closing * math.radians(rate)
-                    a_lat = max(min(a_lat, PRONAV_CLAMP), -PRONAV_CLAMP)
-                    perp = los_rad + math.pi / 2
-                    vn += a_lat * math.cos(perp) * dt
-                    ve += a_lat * math.sin(perp) * dt
-            self._prev_los = los
-            self._prev_time = now
-            alt_err = target.alt - drone_alt
-            vd = -max(min(alt_err * 1.0, 3.0), -3.0)
-            return vn, ve, vd
-
-        elif dist > RAM_RANGE_M:
-            self.phase = "PURSUIT"
-            self._prev_los = None
-            self._prev_time = None
-            b = bearing_deg(drone_lat, drone_lon, target.lat, target.lon)
-            speed = speed_for_dist(dist)
-            br = math.radians(b)
-            vn = speed * math.cos(br)
-            ve = speed * math.sin(br)
-            alt_err = target.alt - drone_alt
-            vd = -max(min(alt_err * 1.5, 4.0), -4.0)
-            return vn, ve, vd
-
-        else:
-            self.phase = "RAM"
-            self._prev_los = None
-            self._prev_time = None
-            b = bearing_deg(drone_lat, drone_lon, target.lat, target.lon)
-            br = math.radians(b)
-            vn = SPEED_RAM * math.cos(br)
-            ve = SPEED_RAM * math.sin(br)
-            alt_err = target.alt - drone_alt
-            vd = -max(min(alt_err * 2.0, 5.0), -5.0)
-            return vn, ve, vd
-
-# ---------------------------------------------------------------------------
-# Build targets — sorted by estimated intercept time (fast targets first)
-# ---------------------------------------------------------------------------
-
-def intercept_time_est(dlat, dlon, target, drone_speed):
-    """Estimate seconds to intercept: dist / closing_rate."""
-    dist = haversine_m(dlat, dlon, target.lat, target.lon)
-    closing = max(drone_speed - target.speed_mps * 0.5, 1.0)  # conservative
-    return dist / closing
-
-def sort_targets(targets, dlat, dlon, drone_speed):
-    """Sort targets by estimated intercept time (shortest first)."""
-    targets.sort(key=lambda t: intercept_time_est(dlat, dlon, t, drone_speed))
-
-def build_targets(lat, lon):
-    targets = [
-        SimTarget(id=1, priority=1,
-                  lat=lat + 0.0008, lon=lon + 0.0005,
-                  alt=DEFAULT_ALT_M, course_deg=45, speed_mps=8),
-        SimTarget(id=2, priority=2,
-                  lat=lat - 0.0005, lon=lon + 0.0010,
-                  alt=DEFAULT_ALT_M, course_deg=120, speed_mps=5),
-        SimTarget(id=3, priority=3,
-                  lat=lat + 0.0012, lon=lon - 0.0003,
-                  alt=DEFAULT_ALT_M, course_deg=315, speed_mps=10),
-    ]
-    sort_targets(targets, lat, lon, SPEED_CRUISE)
-    return targets
-
-# ---------------------------------------------------------------------------
-# Main — v9 boot + v10 intercept
-# ---------------------------------------------------------------------------
-
-def run(conn):
-    print(f"Connecting to {conn} ...")
-    vehicle = connect(conn, wait_ready=True, heartbeat_timeout=60)
-    force_speed_params(vehicle)
-
-    def _sig(s, f):
-        print("\n[SIGINT] Landing ...")
-        vehicle.mode = VehicleMode("LAND")
-        time.sleep(2); vehicle.close(); sys.exit(0)
-    signal.signal(signal.SIGINT, _sig)
-
-    arm_and_takeoff(vehicle, DEFAULT_ALT_M)
-
-    loc = vehicle.location.global_relative_frame
-    targets = build_targets(loc.lat, loc.lon)
-    for t in targets:
-        t.reset_clock()
-        d = haversine_m(loc.lat, loc.lon, t.lat, t.lon)
-        print(f"  Target #{t.id}: {d:.0f} m, speed {t.speed_mps} m/s, "
-              f"hdg {t.course_deg}")
-
-    guidance = HybridGuidance()
-    active = list(targets)
-    done = []
-    peak_gs = 0.0
-    t0 = time.time()
-
-    print("\n" + "=" * 50)
-    print("  INTERCEPT v11 — HYBRID GUIDANCE")
-    print("  Freestyle params + intercept-time priority")
-    print("  PRONAV > PURSUIT > RAM")
-    print("  Velocity NED — target 30+ m/s")
-    print("=" * 50 + "\n")
-
-    while active:
-        loc = vehicle.location.global_relative_frame
-        gs = vehicle.groundspeed or 0.0
-        alt = loc.alt or 0.0
-        peak_gs = max(peak_gs, gs)
-
-        for t in active:
-            t.step()
-
-        tgt = min(active, key=lambda t: haversine_m(
-            loc.lat, loc.lon, t.lat, t.lon))
-        dist = haversine_m(loc.lat, loc.lon, tgt.lat, tgt.lon)
-
-        if dist <= CONTACT_THRESHOLD_M:
-            elapsed = time.time() - t0
-            print(f"\n  *** INTERCEPT #{tgt.id} d={dist:.1f}m "
-                  f"GS={gs:.1f}m/s t={elapsed:.1f}s ***\n")
-            done.append(tgt.id)
-            active.remove(tgt)
-            guidance.reset()
-            if active:
-                sort_targets(active, loc.lat, loc.lon, gs)
-                print(f"  Re-sorted: next → T#{active[0].id} "
-                      f"({active[0].speed_mps} m/s)")
-            continue
-
-        vn, ve, vd = guidance.compute(loc.lat, loc.lon, alt, gs, tgt)
-        send_velocity_ned(vehicle, vn, ve, vd)
-
-        cmd_spd = math.sqrt(vn**2 + ve**2)
-        print(f"  T#{tgt.id} [{guidance.phase:7s}] "
-              f"d={dist:6.1f}m  GS={gs:5.1f}  "
-              f"cmd={cmd_spd:5.1f}  pk={peak_gs:.1f}")
-
-        time.sleep(COMMAND_INTERVAL_S)
-
-    elapsed = time.time() - t0
-    print(f"\n" + "=" * 50)
-    print(f"  MISSION COMPLETE -- {elapsed:.1f}s")
-    print(f"  Intercepted: {done}")
-    print(f"  Peak groundspeed: {peak_gs:.1f} m/s")
-    print("=" * 50 + "\n")
-
-    vehicle.mode = VehicleMode("RTL")
-    time.sleep(5)
-    vehicle.close()
+        time.sleep(1)
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--connect", default="tcp:127.0.0.1:5760")
-    run(p.parse_args().connect)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--connect', default='tcp:127.0.0.1:5760')
+    args = parser.parse_args()
 
-if __name__ == "__main__":
+    print(f"Connecting to {args.connect} ...\n")
+    vehicle = connect(args.connect, wait_ready=True, heartbeat_timeout=60)
+
+    arm_and_takeoff(vehicle, 60.0)
+    home_loc = vehicle.location.global_relative_frame
+
+    print("==================================================")
+    print("  THE SPEAR v12.4 — PRONAV KINETIC INTERCEPTOR")
+    print("  Military-Grade Tracking & Failsafes Active")
+    print("==================================================")
+
+    targets = [
+        {"id": 1, "lat": home_loc.lat + 0.002, "lon": home_loc.lon + 0.002, "alt": 30},
+        {"id": 2, "lat": home_loc.lat + 0.004, "lon": home_loc.lon - 0.003, "alt": 30},
+    ]
+
+    path_x, path_y, path_z = [], [], []
+    peak_gs = 0.0
+    start_time = time.time()
+
+    for t in targets:
+        target_loc = LocationGlobalRelative(t["lat"], t["lon"], t["alt"])
+        intercepted = False
+        
+        # Reset ProNav state for the new target
+        prev_bearing = None
+        prev_dist = None
+        prev_time = time.time()
+        
+        while not intercepted:
+            curr_loc = vehicle.location.global_relative_frame
+            current_time = time.time()
+            dt = current_time - prev_time
+            
+            if dt <= 0.0:
+                time.sleep(0.01)
+                continue
+
+            dist = get_distance_meters(curr_loc, target_loc)
+            bearing = get_bearing(curr_loc, target_loc)
+            gs = vehicle.groundspeed
+            
+            x, y = get_local_xy(home_loc, curr_loc)
+            path_x.append(x)
+            path_y.append(y)
+            path_z.append(curr_loc.alt)
+
+            if gs > peak_gs:
+                peak_gs = gs
+
+            # --- 1. STRICT SAFETY FAILSAFES ---
+            if get_distance_meters(home_loc, curr_loc) > MAX_FLIGHT_RADIUS_M:
+                print(f"\n[FAILSAFE] Geofence Breach ({MAX_FLIGHT_RADIUS_M}m) -> ABORT STRIKE!")
+                vehicle.mode = VehicleMode("RTL")
+                return
+
+            if curr_loc.alt < MIN_ALT_M:
+                print(f"\n[FAILSAFE] Hard Deck Breach ({curr_loc.alt:.1f}m) -> CLIMBING!")
+                set_attitude_thrust(vehicle, roll_deg=0.0, pitch_deg=-10.0, yaw_deg=bearing, thrust=1.0)
+                time.sleep(0.5)
+                continue
+                
+            if vehicle.battery.voltage is not None and vehicle.battery.voltage > 0:
+                if vehicle.battery.voltage < CRIT_VOLTAGE:
+                    print(f"\n[FAILSAFE] Voltage Sag ({vehicle.battery.voltage}V) -> ABORT STRIKE!")
+                    vehicle.mode = VehicleMode("RTL")
+                    return
+
+            # --- 2. PRONAV MATH (LAMBDA DOT) ---
+            if prev_bearing is not None and prev_dist is not None:
+                closing_speed = (prev_dist - dist) / dt
+                
+                delta_bearing = bearing - prev_bearing
+                if delta_bearing > 180.0: delta_bearing -= 360.0
+                if delta_bearing < -180.0: delta_bearing += 360.0
+                los_rate = delta_bearing / dt
+                
+                # a_c = N * V_c * lambda_dot
+                lead_angle = N_CONST * los_rate * max(1.0, (closing_speed / 10.0))
+                lead_angle = max(-45.0, min(45.0, lead_angle))
+                intercept_heading = (bearing + lead_angle) % 360.0
+            else:
+                intercept_heading = bearing
+                closing_speed = 0.0
+
+            prev_bearing = bearing
+            prev_dist = dist
+            prev_time = current_time
+
+            # --- 3. PROXIMITY FUSE ---
+            if dist < INTERCEPT_RADIUS_M or (closing_speed > 20.0 and dist < 25.0):
+                mission_t = time.time() - start_time
+                print(f"\n  *** TARGET KINETIC INTERCEPT d={dist:.1f}m GS={gs:.1f}m/s t={mission_t:.1f}s ***\n")
+                set_attitude_thrust(vehicle, 0.0, 45.0, intercept_heading, 1.0)
+                time.sleep(1)
+                intercepted = True
+                break
+
+            # --- 4. FLIGHT CONTROL EXECUTION ---
+            yaw_error = intercept_heading - vehicle.heading
+            yaw_error = (yaw_error + 180) % 360 - 180
+            attack_roll = max(-45.0, min(45.0, yaw_error * 1.5))
+
+            alt_error = curr_loc.alt - target_loc.alt
+            if alt_error > 20.0:
+                attack_pitch = -60.0  
+            else:
+                attack_pitch = -40.0  
+
+            set_attitude_thrust(vehicle, roll_deg=attack_roll, pitch_deg=attack_pitch, yaw_deg=intercept_heading, thrust=1.0)
+            
+            print(f"  T#{t['id']} [PRONAV] d={dist:5.1f}m GS={gs:4.1f} Vc={closing_speed:4.1f} | hdg={intercept_heading:5.1f} roll={attack_roll:4.1f}")
+            time.sleep(0.05) # 20Hz control loop
+
+    print("==================================================")
+    print(f"  MISSION COMPLETE -- {time.time() - start_time:.1f}s")
+    print(f"  Peak groundspeed: {peak_gs:.1f} m/s")
+    print("==================================================")
+    
+    vehicle.mode = VehicleMode("RTL")
+    vehicle.close()
+
+    print("\nGenerating 3D Flight Trajectory...")
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(path_x, path_y, path_z, label='Spear Trajectory', color='cyan', linewidth=2)
+    ax.scatter([0], [0], [60], color='blue', marker='^', s=150, label='Launch / Home')
+    
+    for t in targets:
+        t_loc = LocationGlobalRelative(t["lat"], t["lon"], t["alt"])
+        tx, ty = get_local_xy(home_loc, t_loc)
+        ax.scatter([tx], [ty], [t["alt"]], color='red', marker='X', s=150, label=f'Target {t["id"]}')
+
+    ax.set_xlabel('X (Meters East)')
+    ax.set_ylabel('Y (Meters North)')
+    ax.set_zlabel('Altitude (Meters)')
+    ax.set_title('The Spear: ProNav Kinetic Intercept')
+    ax.legend()
+    plt.savefig("intercept_trajectory.png", dpi=300)
+    print("Graph saved to 'intercept_trajectory.png'.")
+
+if __name__ == '__main__':
     main()
