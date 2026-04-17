@@ -1,0 +1,7 @@
+trial,result,time_to_hit,min_sep,launch_err,vision_count,acoustic_count,elapsed
+1,MISS-TIMEOUT,-1,15.0,7.6,0,267,104
+2,MISS-TIMEOUT,-1,15.0,4.7,0,268,104
+3,MISS-TIMEOUT,-1,15.0,5.3,0,261,105
+4,MISS-TIMEOUT,-1,15.0,10.6,0,277,104
+5,MISS-TIMEOUT,-1,15.0,7.3,0,273,105
+6,MISS-TIMEOUT,-1,15.0,2.5,0,269,104
